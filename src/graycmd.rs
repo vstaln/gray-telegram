@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 
 /// A `cmd` child answers within this window; a wedged one is killed.
 const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Registry rows marked `slow` (compaction, plugin calls, updates) get
+/// this window instead — there is no platform deadline on a plain reply.
+const SLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Registry freshness: a good list lives 5 minutes; a failed probe is
 /// remembered for 1 so `/typo` bursts cannot fork a child per message.
 const REGISTRY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -36,6 +39,8 @@ pub struct CmdSpec {
     pub scope: String,
     /// `text` and `interactive` dispatch; `local` is TUI-only.
     pub surface: String,
+    /// Runs that can exceed the normal timeout.
+    pub slow: bool,
 }
 
 /// A fetched registry snapshot.
@@ -78,6 +83,7 @@ impl CommandList {
                         .and_then(Value::as_str)
                         .unwrap_or("interactive")
                         .to_string(),
+                    slow: c.get("slow").and_then(Value::as_bool).unwrap_or(false),
                 })
             })
             .collect();
@@ -146,6 +152,15 @@ impl Registry {
 /// PATH rebuilt so provider plugins resolve, own process group for the
 /// timeout kill). The reply is the single JSON object on stdout.
 async fn cmd_json(bin: &Path, home: &Path, argv: &[&str]) -> Result<Value, String> {
+    cmd_json_t(bin, home, argv, CMD_TIMEOUT).await
+}
+
+async fn cmd_json_t(
+    bin: &Path,
+    home: &Path,
+    argv: &[&str],
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("cmd").args(argv);
     cmd.current_dir(home);
@@ -179,7 +194,7 @@ async fn cmd_json(bin: &Path, home: &Path, argv: &[&str]) -> Result<Value, Strin
     );
     let child = cmd.spawn().map_err(|_| "cannot spawn gray".to_string())?;
     let pid = child.id().unwrap_or(0);
-    let out = match tokio::time::timeout(CMD_TIMEOUT, child.wait_with_output()).await {
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(_)) => return Err("gray cmd failed".to_string()),
         Err(_) => {
@@ -341,7 +356,12 @@ pub async fn dispatch(
     if !args.trim().is_empty() {
         argv.push(args.trim());
     }
-    let reply = match cmd_json(&bin, &home, &argv).await {
+    let timeout = if spec.as_ref().map(|s| s.slow).unwrap_or(false) {
+        SLOW_TIMEOUT
+    } else {
+        CMD_TIMEOUT
+    };
+    let reply = match cmd_json_t(&bin, &home, &argv, timeout).await {
         Ok(v) => v,
         Err(_) => {
             let _ = rest
@@ -366,6 +386,34 @@ pub async fn dispatch(
         }
         Ok(Reply::Result(result)) => {
             match result.get("kind").and_then(Value::as_str) {
+                Some("prompt") => {
+                    let prompt = result
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let fallback = result
+                        .get("fallback_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let capacity = config
+                        .get("queue_capacity")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1000);
+                    let id = format!("tg:cmd:{}", crate::durable::uuid_hex());
+                    let text = match store.enqueue(
+                        &id,
+                        chat_id,
+                        prompt,
+                        Some(conversation),
+                        capacity,
+                    ) {
+                        Ok(true) if fallback.trim().is_empty() => "Working on it.".to_string(),
+                        Ok(true) => crate::text::escape_html(fallback),
+                        Ok(false) => "That turn is already queued.".to_string(),
+                        Err(e) => crate::text::escape_html(&e),
+                    };
+                    let _ = rest.send_text(chat_id, &text).await;
+                }
                 Some("ui") => {
                     let token = result.get("token").and_then(Value::as_str).unwrap_or("");
                     let document = result.get("document").cloned().unwrap_or(Value::Null);
@@ -504,6 +552,43 @@ pub async fn callback(
             }
         },
         Ok(Reply::Result(result)) => match result.get("kind").and_then(Value::as_str) {
+            Some("prompt") => {
+                let prompt = result
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let fallback = result
+                    .get("fallback_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let is_private =
+                    msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
+                let conv =
+                    crate::session::conversation_key(&chat_id, &from_id, is_private);
+                let capacity = config
+                    .get("queue_capacity")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1000);
+                let id = format!("tg:cmd:{}", crate::durable::uuid_hex());
+                match store.enqueue(&id, &chat_id, prompt, Some(&conv), capacity) {
+                    Ok(true) => {
+                        let text = if fallback.trim().is_empty() {
+                            "Working on it.".to_string()
+                        } else {
+                            crate::text::escape_html(fallback)
+                        };
+                        let _ = rest.send_text(&chat_id, &text).await;
+                        toast(None, false).await;
+                    }
+                    Ok(false) => {
+                        toast(Some("That turn is already queued."), false).await;
+                    }
+                    Err(e) => {
+                        let short: String = e.chars().take(180).collect();
+                        toast(Some(&short), false).await;
+                    }
+                }
+            }
             Some("ui") => {
                 let document = result.get("document").cloned().unwrap_or(Value::Null);
                 // Editable docs keep their token, but if core ever hands a
