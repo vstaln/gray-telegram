@@ -497,7 +497,7 @@ impl Drop for InputFileGuard {
 /// A supervisor (runit, systemd) hands the daemon a bare PATH. gray's
 /// provider plugins and their CLIs live beside the gray binary and in the
 /// user's bin dirs, so put those first or every turn dies as `agent_failed`.
-fn child_path(
+pub(crate) fn child_path(
     existing: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
     gray_bin: &Path,

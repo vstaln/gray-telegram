@@ -195,10 +195,10 @@ impl Rest {
             .json(&json!({
                 "offset": offset,
                 "timeout": LONG_POLL_SECS,
-                // The bridge reads message updates only: text, photos, docs,
-                // captions. Skipping the rest keeps the wire small and stops
-                // callback/reaction spam from churning the offset.
-                "allowed_updates": ["message"]
+                // The bridge reads message updates (text, photos, docs,
+                // captions) and the `gc|` button presses inline keyboards
+                // produce. Skipping the rest keeps the wire small.
+                "allowed_updates": ["message", "callback_query"]
             }))
             .timeout(POLL_TIMEOUT);
         let resp = req.send().await.map_err(|e| {
@@ -219,26 +219,102 @@ impl Rest {
     /// HTML (a stray `<` in model output) retries once as plain text rather
     /// than failing the delivery.
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<Value, TransportError> {
+        self.send_message(chat_id, text, Value::Null).await
+    }
+
+    /// `sendMessage` carrying an inline keyboard (`reply_markup`). The same
+    /// HTML→plain retry applies: a refused body never strands the buttons.
+    pub async fn send_markup(
+        &self,
+        chat_id: &str,
+        text: &str,
+        markup: &Value,
+    ) -> Result<Value, TransportError> {
+        self.send_message(chat_id, text, markup.clone()).await
+    }
+
+    async fn send_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        markup: Value,
+    ) -> Result<Value, TransportError> {
         check_bounds(text, MAX_MESSAGE_LEN, "Message must contain 1-4096 characters")?;
-        let params = json!({
+        let mut params = json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "link_preview_options": {"is_disabled": true},
         });
+        if markup.is_object() {
+            params["reply_markup"] = markup;
+        }
         match self.call("sendMessage", &params).await {
             Err(TransportError::Http(400, detail))
                 if detail.to_ascii_lowercase().contains("parse") =>
             {
-                let plain = json!({
-                    "chat_id": chat_id,
-                    "text": text,
-                    "link_preview_options": {"is_disabled": true},
-                });
-                self.call("sendMessage", &plain).await
+                params.as_object_mut().map(|p| p.remove("parse_mode"));
+                self.call("sendMessage", &params).await
             }
             other => other,
         }
+    }
+
+    /// `editMessageText` on a picker message. `markup` replaces the
+    /// keyboard (`{"inline_keyboard":[]}` drops it); `None` leaves it.
+    pub async fn edit_message(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        text: &str,
+        markup: Option<&Value>,
+    ) -> Result<Value, TransportError> {
+        check_bounds(text, MAX_MESSAGE_LEN, "Message must contain 1-4096 characters")?;
+        let mut params = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+        });
+        if let Some(markup) = markup {
+            params["reply_markup"] = markup.clone();
+        }
+        match self.call("editMessageText", &params).await {
+            Err(TransportError::Http(400, detail))
+                if detail.to_ascii_lowercase().contains("parse") =>
+            {
+                params.as_object_mut().map(|p| p.remove("parse_mode"));
+                self.call("editMessageText", &params).await
+            }
+            other => other,
+        }
+    }
+
+    /// `answerCallbackQuery` — dismisses the client's loading spinner; the
+    /// optional `text` pops as a toast (`alert` for errors it must see).
+    pub async fn answer_callback(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+        alert: bool,
+    ) -> Result<(), TransportError> {
+        self.call(
+            "answerCallbackQuery",
+            &json!({
+                "callback_query_id": callback_query_id,
+                "text": text.unwrap_or(""),
+                "show_alert": alert,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `setMyCommands` — the visible slash menu Telegram clients show.
+    pub async fn set_my_commands(&self, commands: &[Value]) -> Result<(), TransportError> {
+        self.call("setMyCommands", &json!({"commands": commands}))
+            .await
+            .map(|_| ())
     }
 
     /// `sendChatAction` — the typing bubble. Best-effort by the caller.

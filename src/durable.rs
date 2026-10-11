@@ -42,6 +42,21 @@ pub struct Schedule {
     pub conversation: String,
 }
 
+/// A stored `gray cmd` ui document: a picker posted as an inline keyboard
+/// waits here until its callback arrives or the core TTL lapses.
+#[derive(Debug, Clone)]
+pub struct CmdDoc {
+    pub doc: String,
+    /// The gray home the `interact` call must run in (conversation or
+    /// global — the scope the originating `run` used).
+    pub home: String,
+    /// The command that produced it, for the expired toast (`/model again`).
+    pub name: String,
+    /// Telegram user id allowed to press its buttons.
+    pub owner: String,
+    pub created: f64,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS inbox (
     id TEXT PRIMARY KEY, channel TEXT NOT NULL, conversation TEXT NOT NULL,
@@ -59,6 +74,9 @@ CREATE TABLE IF NOT EXISTS schedules (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS pairings (
     code TEXT PRIMARY KEY, user_id TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS cmd_docs (
+    token TEXT PRIMARY KEY, doc TEXT NOT NULL, home TEXT NOT NULL,
+    name TEXT NOT NULL, owner TEXT NOT NULL, created REAL NOT NULL);
 ";
 
 fn connect(path: &Path) -> Result<Connection, String> {
@@ -558,6 +576,75 @@ impl Store {
                     .map_err(|_| "cannot consume pairing".to_string())?;
             }
             Ok(found)
+        })
+    }
+
+    /// Store a pending ui document under its core token. Replaces any older
+    /// revision of the same picker (interact returns revised docs).
+    pub fn cmd_doc_put(
+        &self,
+        token: &str,
+        doc: &str,
+        home: &str,
+        name: &str,
+        owner: &str,
+        now: f64,
+    ) -> Result<(), String> {
+        if token.is_empty() || token.len() > 128 || doc.len() > 65536 {
+            return Err("invalid command document".to_string());
+        }
+        with_conn(&self.path, |db| {
+            db.execute(
+                "INSERT OR REPLACE INTO cmd_docs(token,doc,home,name,owner,created)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![token, doc, home, name, owner, now],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store command document".to_string())
+        })
+    }
+
+    /// The document behind a callback token; `None` when it aged past
+    /// `ttl_secs` (the row is deleted — an expired picker stays expired).
+    pub fn cmd_doc_get(&self, token: &str, ttl_secs: f64, now: f64) -> Result<Option<CmdDoc>, String> {
+        let row: Option<CmdDoc> = with_conn(&self.path, |db| {
+            optional(db.query_row(
+                "SELECT doc,home,name,owner,created FROM cmd_docs WHERE token=?1",
+                params![token],
+                |r| {
+                    Ok(CmdDoc {
+                        doc: r.get(0)?,
+                        home: r.get(1)?,
+                        name: r.get(2)?,
+                        owner: r.get(3)?,
+                        created: r.get(4)?,
+                    })
+                },
+            ))
+        })?;
+        match row {
+            Some(d) if now - d.created >= ttl_secs => {
+                let _ = self.cmd_doc_delete(token);
+                Ok(None)
+            }
+            other => Ok(other),
+        }
+    }
+
+    pub fn cmd_doc_delete(&self, token: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute("DELETE FROM cmd_docs WHERE token=?1", params![token])
+                .map(|_| ())
+                .map_err(|_| "cannot delete command document".to_string())
+        })
+    }
+
+    /// Drop pickers whose TTL lapsed; called beside `prune_terminal`.
+    pub fn prune_cmd_docs(&self, ttl_secs: f64, now: f64) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute("DELETE FROM cmd_docs WHERE created<?1", params![now - ttl_secs])
+                .map(|_| ())
+                .map_err(|_| "cannot prune command documents".to_string())
         })
     }
 

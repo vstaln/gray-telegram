@@ -464,6 +464,22 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .unwrap_or(".")
         .to_string();
 
+    // The `gray cmd` registry (5-minute cache); `list` runs in the main home.
+    let registry = std::sync::Arc::new(crate::graycmd::Registry::new(
+        PathBuf::from(
+            config
+                .get("gray_bin")
+                .and_then(Value::as_str)
+                .unwrap_or("gray"),
+        ),
+        PathBuf::from(
+            config
+                .get("gray_home")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+    ));
+
     let rest = Rest::production(&token);
     // A stale webhook silently eats the updates we poll for; clear it.
     if let Err(e) = rest.delete_webhook().await {
@@ -489,6 +505,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         });
         let _ = crate::config::atomic_json(&state_path, &state);
     }
+    // The visible slash menu: built-ins plus the top `cmd` entries.
+    crate::graycmd::register_commands(&rest, &registry).await;
 
     // Boot lifecycle: count the turns a dead run left marked running BEFORE
     // recovery rewrites them, then recover them into `uncertain`.
@@ -671,7 +689,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         failures = 0;
                         for update in &updates {
                             let id = update.get("update_id").and_then(Value::as_i64).unwrap_or(0);
-                            if let Some(m) = inbound(update, &bot_username, &bot_id) {
+                            if let Some(cq) = update.get("callback_query") {
+                                crate::graycmd::callback(
+                                    &config, &store, &rest, cq, &owner_id, &allowed,
+                                )
+                                .await;
+                            } else if let Some(m) = inbound(update, &bot_username, &bot_id) {
                                 handle_inbound(
                                     &m,
                                     &config,
@@ -684,6 +707,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     &bot_username,
                                     &workdir,
                                     max_attachment_bytes,
+                                    &registry,
                                 )
                                 .await;
                             }
@@ -745,6 +769,7 @@ async fn handle_inbound(
     bot_username: &str,
     workdir: &str,
     max_attachment_bytes: u64,
+    registry: &crate::graycmd::Registry,
 ) {
     // Receipt log: every message the gateway sees, by surface. Never the
     // content — this is the only way to tell "never messaged" from "update
@@ -757,10 +782,19 @@ async fn handle_inbound(
     let conversation = crate::session::conversation_key(&m.chat_id, &m.user_id, m.is_private);
 
     // Commands first: /start is the pairing hello for strangers and a
-    // greeting for the admitted; the rest need admission.
-    if let Some(cmd) = crate::commands::parse(&m.text, bot_username) {
+    // greeting for the admitted; the rest need admission. The registry
+    // snapshot resolves `gray cmd` names — strangers stay on today's
+    // fallback (unknown `/foo` falls through to the pairing path) and we
+    // never spawn `cmd list` for them.
+    let admitted = crate::policy::is_allowed_user(&m.user_id, owner_id, allowed);
+    // The registry only matters for `/`-text; a plain prompt never spawns.
+    let snapshot = if admitted && m.text.trim_start().starts_with('/') {
+        registry.get().await
+    } else {
+        None
+    };
+    if let Some(cmd) = crate::commands::parse(&m.text, bot_username, snapshot.as_deref()) {
         use crate::commands::BotCommand::*;
-        let admitted = crate::policy::is_allowed_user(&m.user_id, owner_id, allowed);
         match cmd {
             Start => {
                 if !admitted && m.is_private {
@@ -811,7 +845,26 @@ async fn handle_inbound(
                     .await;
             }
             Help => {
-                let _ = rest.send_text(&m.chat_id, crate::commands::HELP).await;
+                let text = crate::graycmd::help_text(snapshot.as_deref());
+                let _ = rest.send_text(&m.chat_id, &text).await;
+            }
+            Gray { ref name, ref args } => {
+                if !admitted {
+                    return send_if_stranger(store, rest, m).await;
+                }
+                crate::graycmd::dispatch(
+                    registry,
+                    config,
+                    config_path,
+                    store,
+                    rest,
+                    &m.chat_id,
+                    &m.user_id,
+                    &conversation,
+                    name,
+                    args,
+                )
+                .await;
             }
         }
         return;

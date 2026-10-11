@@ -180,8 +180,13 @@ fn write_executable(path: &Path, text: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Both e2e tests retarget the Bot API through one process-global env var;
+/// the lock keeps their daemons from ever reading each other's base.
+static API_BASE_LOCK: Mutex<()> = Mutex::new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mock_bot_api_end_to_end() {
+    let _api_lock = API_BASE_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -308,6 +313,132 @@ async fn mock_bot_api_end_to_end() {
             5
         ),
         "telegram_send never hit sendMessage on the mock"
+    );
+
+    daemon.abort();
+}
+
+/// The `gray cmd` surface end to end: `/model` runs `cmd run`, the ui
+/// document becomes an inline keyboard, and a `gc|` button press drives
+/// `cmd interact` into an edited message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mock_bot_api_cmd_surface() {
+    let _api_lock = API_BASE_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // fake `gray`: `cmd` answers the contract JSON; anything else is the
+    // usual `gray -p --json` turn row.
+    let fake = dir.join("fake-gray");
+    write_executable(
+        &fake,
+        r#"#!/bin/sh
+if [ "$1" = "cmd" ]; then
+  case "$2" in
+    list) echo '{"ok":true,"protocol":1,"result":{"commands":[{"name":"model","description":"pick the model","aliases":["m"],"args":[],"scope":"conversation","surface":"interactive"},{"name":"usage","description":"tokens","aliases":[],"args":[],"scope":"conversation","surface":"text"},{"name":"quit","description":"tui","aliases":[],"args":[],"scope":"global","surface":"local"}]}}' ;;
+    run) echo '{"ok":true,"protocol":1,"result":{"kind":"ui","token":"tok-e2e","document":{"protocol":"gray.ui","version":1,"surface":"message","document_id":"model-picker","visibility":"ephemeral","lifecycle":"editable","components":[{"type":"text","content":"**Model** — `gpt-5`"},{"type":"action_row","children":[{"type":"string_select","logical_id":"model","options":[{"label":"GPT 5","value":"openai/gpt-5","default":true},{"label":"Claude","value":"anthropic/claude"}]}]},{"type":"action_row","children":[{"type":"button","logical_id":"apply","label":"Apply","style":"primary"},{"type":"button","logical_id":"cancel","label":"Cancel","style":"secondary"}]}]},"fallback_text":"pick a model"}}' ;;
+    interact) echo '{"ok":true,"protocol":1,"result":{"kind":"text","text":"Model set to claude.","close":true}}' ;;
+    *) echo '{"ok":false,"error":{"code":"unknown_command","message":"?","retryable":false}}' ;;
+  esac
+  exit 0
+fi
+echo '{"protocol":1,"turn_id":"t1","session_id":"sess-1","type":"result","text":"E2E MOCK ANSWER from fake gray"}'
+"#,
+    );
+    let ghome = dir.join("ghome");
+    std::fs::create_dir(&ghome).unwrap();
+    std::fs::write(ghome.join("config.json"), "{\"model\":\"mock-model\"}").unwrap();
+    let work = dir.join("work");
+    std::fs::create_dir(&work).unwrap();
+
+    let cfg_path = dir.join("config.json");
+    let cfg = json!({
+        "token": "TESTTOKEN",
+        "chat_id": "555",
+        "owner_id": "777",
+        "gray_bin": fake.to_string_lossy(),
+        "gray_home": ghome.to_string_lossy(),
+        "workdir": work.to_string_lossy(),
+        "restart_notification": false,
+        "concurrency": 1,
+        "timeout_seconds": 60,
+    });
+    crate::config::atomic_json(&cfg_path, &cfg).unwrap();
+
+    let mock = MockApi::start();
+    std::env::set_var("GRAY_TELEGRAM_TEST_API_BASE", &mock.base);
+
+    let run_path = cfg_path.clone();
+    let daemon = tokio::spawn(async move { crate::gateway::run(&run_path).await });
+
+    assert!(
+        mock.wait_for("getMe", |_| true, 10),
+        "daemon never called getMe"
+    );
+    // Boot registered the visible command menu from `cmd list`.
+    assert!(
+        mock.wait_for(
+            "setMyCommands",
+            |b| b.get("commands")
+                .and_then(Value::as_array)
+                .is_some_and(|c| c.iter().any(|e| e["command"] == "model")),
+            10
+        ),
+        "setMyCommands never carried the registry commands"
+    );
+
+    // `/model` -> cmd run -> a ui document posted as an inline keyboard.
+    mock.push(json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 10,
+            "date": 1,
+            "chat": {"id": 555, "type": "private"},
+            "from": {"id": 777, "is_bot": false, "first_name": "A"},
+            "text": "/model"
+        }
+    }));
+    assert!(
+        mock.wait_for(
+            "sendMessage",
+            |b| serde_json::to_string(b).is_ok_and(|t| t.contains("gc|tok-e2e|model|1")),
+            20
+        ),
+        "picker keyboard never reached sendMessage"
+    );
+
+    // Its press -> cmd interact -> the message is edited, keyboard dropped.
+    mock.push(json!({
+        "update_id": 2,
+        "callback_query": {
+            "id": "cbq1",
+            "from": {"id": 777, "is_bot": false, "first_name": "A"},
+            "message": {"message_id": 9001, "chat": {"id": 555}},
+            "data": "gc|tok-e2e|model|1"
+        }
+    }));
+    assert!(
+        mock.wait_for(
+            "editMessageText",
+            |b| b.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.contains("Model set to claude")),
+            20
+        ),
+        "interact result never edited the picker message"
+    );
+    assert!(
+        mock.wait_for("answerCallbackQuery", |_| true, 10),
+        "callback query was never answered"
+    );
+    // The stored document was consumed by the close.
+    let store = crate::gateway::open_store(&cfg_path).unwrap();
+    assert!(
+        store
+            .cmd_doc_get("tok-e2e", crate::graycmd::DOC_TTL_SECS, crate::durable::now_secs())
+            .unwrap()
+            .is_none(),
+        "closed picker document was not deleted"
     );
 
     daemon.abort();
