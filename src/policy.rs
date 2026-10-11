@@ -4,6 +4,7 @@ use std::hint::black_box;
 /// Admit one inbound message. Returns the cleaned prompt, or `None` to drop:
 /// unknown/empty owner, bot authors, non-allowlisted senders, group messages
 /// that neither mention the bot nor reply to it, and empty text.
+#[allow(clippy::too_many_arguments)]
 pub fn incoming(
     author: &str,
     owner: &str,
@@ -93,7 +94,17 @@ mod tests {
             None
         );
         assert_eq!(
-            incoming("1", "1", false, false, "hey @bot hi", "bot", true, false, &[]),
+            incoming(
+                "1",
+                "1",
+                false,
+                false,
+                "hey @bot hi",
+                "bot",
+                true,
+                false,
+                &[]
+            ),
             Some("hey  hi".into())
         );
     }

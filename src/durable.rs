@@ -217,14 +217,26 @@ impl Store {
     /// Claim the next queued turn. One running turn per conversation at a
     /// time — a chat's messages answer in order even with workers > 1.
     pub fn claim(&self) -> Result<Option<InboxItem>, String> {
+        self.claim_except(&[])
+    }
+
+    pub fn claim_except(&self, skip: &[String]) -> Result<Option<InboxItem>, String> {
         with_conn(&self.path, |db| {
-            let item: Option<InboxItem> = optional(db.query_row(
-                "SELECT * FROM inbox q WHERE state='queued' AND cancel=0 AND NOT EXISTS
+            let skip_sql = if skip.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " AND IFNULL(q.conversation,'') NOT IN ({})",
+                    vec!["?"; skip.len()].join(",")
+                )
+            };
+            let sql = format!(
+                "SELECT * FROM inbox q WHERE state='queued' AND cancel=0{skip_sql} AND NOT EXISTS
                  (SELECT 1 FROM inbox r WHERE r.conversation=q.conversation AND r.state='running')
-                 ORDER BY created,id LIMIT 1",
-                [],
-                row_item,
-            ))?;
+                 ORDER BY created,id LIMIT 1"
+            );
+            let item: Option<InboxItem> =
+                optional(db.query_row(&sql, rusqlite::params_from_iter(skip.iter()), row_item))?;
             if let Some(ref it) = item {
                 db.execute(
                     "UPDATE inbox SET state='running' WHERE id=?1",
@@ -304,6 +316,30 @@ impl Store {
     }
 
     /// Queued + running + delivery rows (`/status` queue depth).
+    pub fn requeue(&self, id: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "UPDATE inbox SET state='queued' WHERE id=?1 AND state='running'",
+                params![id],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot requeue".to_string())
+        })
+    }
+
+    pub fn ahead_in_conversation(&self, conversation: &str, id: &str) -> Result<i64, String> {
+        with_conn(&self.path, |db| {
+            db.query_row(
+                "SELECT count(*) FROM inbox r WHERE r.conversation=?1 AND r.id<>?2 AND r.cancel=0
+                 AND (r.state='running' OR (r.state='queued' AND (r.created,r.id) <
+                 (SELECT created,id FROM inbox WHERE id=?2)))",
+                params![conversation, id],
+                |r| r.get(0),
+            )
+            .map_err(|_| "cannot count queue".to_string())
+        })
+    }
+
     pub fn pending_count(&self) -> Result<i64, String> {
         with_conn(&self.path, |db| {
             db.query_row(

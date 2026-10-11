@@ -87,14 +87,16 @@ pub fn approve(config_path: &Path, platform: &str, code: &str) -> Result<String,
         .get("owner_id")
         .and_then(Value::as_str)
         .is_none_or(|o| o.is_empty());
-    let note;
-    if owner_missing {
+    let note = if owner_missing {
         config["owner_id"] = Value::String(user.clone());
         // A fresh owner's own DM is also the home chat when none is set.
-        if !config.get("chat_id").is_some_and(crate::config::telegram_id) {
+        if !config
+            .get("chat_id")
+            .is_some_and(crate::config::telegram_id)
+        {
             config["chat_id"] = Value::String(user.clone());
         }
-        note = format!("{user} is now the bot owner");
+        format!("{user} is now the bot owner")
     } else {
         let mut allowed: Vec<String> = config
             .get("allowed_users")
@@ -111,8 +113,10 @@ pub fn approve(config_path: &Path, platform: &str, code: &str) -> Result<String,
         }
         allowed.push(user.clone());
         config["allowed_users"] = Value::Array(allowed.into_iter().map(Value::String).collect());
-        note = format!("{user} can now message the bot");
-    }
+        format!("{user} can now message the bot")
+    };
     crate::config::save_config(config_path, &config)?;
-    Ok(format!("{note}; restart the gateway to apply (it re-reads on start)"))
+    Ok(format!(
+        "{note}; restart the gateway to apply (it re-reads on start)"
+    ))
 }

@@ -52,8 +52,13 @@ Useful commands: `queue list|cancel`, `schedule add|list|remove`,
 ## In-chat commands
 
 `/start` (pairing/greeting), `/new` (fresh session), `/stop` (cancel the
-running turn), `/status`, `/help`. Photos and documents are downloaded via
-`getFile` and handed to the agent as file paths.
+running turn), `/steer <text>` (add guidance to the running turn; when idle it
+is sent as a new message), `/status`, `/help`. Photos and documents are
+downloaded via `getFile` and handed to the agent as file paths.
+
+A message sent while a turn runs queues as its own next turn ("Queued — N
+ahead.", at most once per 30s per conversation). `"busy_input_mode": "steer"`
+in the config makes such messages steer the running turn instead.
 
 ## Tools
 

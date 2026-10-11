@@ -194,7 +194,9 @@ pub fn default_pairing(token: &str, code: &str) -> PairingFut {
                 break;
             }
             let poll = tokio::time::timeout(
-                left.min(std::time::Duration::from_secs(crate::transport::LONG_POLL_SECS + 15)),
+                left.min(std::time::Duration::from_secs(
+                    crate::transport::LONG_POLL_SECS + 15,
+                )),
                 rest.get_updates(offset),
             )
             .await;
@@ -209,7 +211,9 @@ pub fn default_pairing(token: &str, code: &str) -> PairingFut {
                 if let Some(id) = update.get("update_id").and_then(Value::as_i64) {
                     offset = offset.max(id + 1);
                 }
-                let Some(msg) = update.get("message") else { continue };
+                let Some(msg) = update.get("message") else {
+                    continue;
+                };
                 let private = msg
                     .get("chat")
                     .and_then(|c| c.get("type"))
@@ -275,9 +279,7 @@ async fn ask_token(
                 io.print_line("Using TELEGRAM_BOT_TOKEN from the environment.");
                 t
             }
-            None => io.prompt_hidden(
-                "Telegram bot token (from @BotFather; input is hidden): ",
-            )?,
+            None => io.prompt_hidden("Telegram bot token (from @BotFather; input is hidden): ")?,
         };
         if token.is_empty() {
             return Err("No bot token supplied".to_string());
@@ -312,11 +314,7 @@ async fn ask_token(
 }
 
 /// The whole wizard. Returns `true` when a config was written.
-pub async fn run(
-    config_path: &Path,
-    io: &mut dyn Prompter,
-    pair: bool,
-) -> Result<bool, String> {
+pub async fn run(config_path: &Path, io: &mut dyn Prompter, pair: bool) -> Result<bool, String> {
     run_with(
         config_path,
         io,
@@ -395,7 +393,7 @@ pub async fn run_with(
             }
             (String::new(), chat)
         } else {
-            anyhow_ids(&[owner.clone()])?;
+            anyhow_ids(std::slice::from_ref(&owner))?;
             let chat = io
                 .prompt(&format!("Home chat ID [{owner}]: "))?
                 .trim()

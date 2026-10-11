@@ -21,6 +21,35 @@ fn daemon_state_path(config_path: &Path) -> PathBuf {
 
 /// Where the persistent getUpdates offset lives.
 const OFFSET_KEY: &str = "update_offset";
+const BUSY_BACKOFF_SECS: f64 = 3.0;
+const QUEUED_ACK_SECS: f64 = 30.0;
+
+fn busy_input_steer(config: &Value) -> bool {
+    config.get("busy_input_mode").and_then(Value::as_str) == Some("steer")
+}
+
+pub fn queued_notice(store: &Store, conversation: &str, id: &str) -> Option<String> {
+    static ACKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
+        std::sync::OnceLock::new();
+    let ahead = store.ahead_in_conversation(conversation, id).ok()?;
+    if ahead <= 0 {
+        return None;
+    }
+    let now = crate::durable::now_secs();
+    let mut acks = ACKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if acks
+        .get(conversation)
+        .is_some_and(|at| now - at < QUEUED_ACK_SECS)
+    {
+        return None;
+    }
+    acks.retain(|_, at| now - *at < QUEUED_ACK_SECS);
+    acks.insert(conversation.to_string(), now);
+    Some(format!("Queued — {ahead} ahead."))
+}
 
 /// Queue/listing helper used by the CLI (`queue`, `schedule`, `pairing`).
 pub fn open_store(config_path: &Path) -> Result<Store, String> {
@@ -165,6 +194,7 @@ pub struct Runtime<R, D> {
     pub rest: Option<Rest>,
     pub clock: Option<std::sync::Arc<dyn Fn() -> f64 + Send + Sync>>,
     last_typing: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    busy_backoff: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
 }
 
 impl<R, D> Runtime<R, D> {
@@ -180,6 +210,7 @@ impl<R, D> Runtime<R, D> {
             last_typing: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            busy_backoff: Default::default(),
         }
     }
 
@@ -288,7 +319,13 @@ impl<R, D> Runtime<R, D> {
             > + Send
             + Sync,
     {
-        let item = match self.store.claim()? {
+        let skip: Vec<String> = {
+            let now = self.now_secs();
+            let mut backoff = self.busy_backoff.lock().unwrap_or_else(|e| e.into_inner());
+            backoff.retain(|_, until| *until > now);
+            backoff.keys().cloned().collect()
+        };
+        let item = match self.store.claim_except(&skip)? {
             Some(it) => it,
             None => return Ok(false),
         };
@@ -320,7 +357,6 @@ impl<R, D> Runtime<R, D> {
             }
         };
         let Some(result) = result else {
-            drop(run_fut);
             self.store.fail(&item.id, "cancelled")?;
             return Ok(true);
         };
@@ -336,6 +372,14 @@ impl<R, D> Runtime<R, D> {
                     self.store.complete(&item.id, &prose, &receipt)?;
                 }
                 self.deliver_media(&item.channel, &media).await;
+            }
+            Err(RunError::Busy) => {
+                self.store.requeue(&item.id)?;
+                let until = self.now_secs() + BUSY_BACKOFF_SECS;
+                self.busy_backoff
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(item.conversation.clone(), until);
             }
             Err(RunError::Budget(_)) => self.store.fail(&item.id, "budget_blocked")?,
             Err(RunError::Timeout) => self.store.fail(&item.id, "timeout")?,
@@ -850,9 +894,36 @@ async fn handle_inbound(
                 let text = if stopped {
                     "Stopped the running task."
                 } else {
-                    "Nothing is running."
+                    "Nothing running."
                 };
                 let _ = rest.send_text(&m.chat_id, text).await;
+            }
+            Steer { ref text } => {
+                if !admitted {
+                    return send_if_stranger(store, rest, m).await;
+                }
+                let reply = if text.trim().is_empty() {
+                    "Usage: /steer &lt;text&gt;".to_string()
+                } else if crate::runner::steer(&conversation, text).await {
+                    "Steering the current turn.".to_string()
+                } else {
+                    let capacity = config
+                        .get("queue_capacity")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1000);
+                    match store.enqueue(
+                        &format!("tg:{}", m.update_id),
+                        &m.chat_id,
+                        text,
+                        Some(&conversation),
+                        capacity,
+                    ) {
+                        Ok(_) => "Nothing running — sent as a new message.".to_string(),
+                        Err(_) => "Queue full or message invalid; this message was not accepted."
+                            .to_string(),
+                    }
+                };
+                let _ = rest.send_text(&m.chat_id, &reply).await;
             }
             Status => {
                 if !admitted {
@@ -871,7 +942,9 @@ async fn handle_inbound(
             }
             Help => {
                 let text = crate::graycmd::help_text(snapshot.as_deref());
-                let _ = rest.send_text(&m.chat_id, &text).await;
+                let home =
+                    runtime_home(config_path, &conversation).unwrap_or_else(|| PathBuf::from("."));
+                crate::graycmd::send_paged(rest, store, &m.chat_id, &m.user_id, &home, &text).await;
             }
             Gray { ref name, ref args } => {
                 if !admitted {
@@ -965,14 +1038,20 @@ async fn handle_inbound(
         .get("queue_capacity")
         .and_then(Value::as_u64)
         .unwrap_or(1000);
-    match store.enqueue(
-        &format!("tg:{}", m.update_id),
-        &m.chat_id,
-        &prompt,
-        Some(&conversation),
-        capacity,
-    ) {
-        Ok(_) => {}
+    if busy_input_steer(config) && crate::runner::steer(&conversation, &prompt).await {
+        let _ = rest
+            .send_text(&m.chat_id, "Steering the current turn.")
+            .await;
+        return;
+    }
+    let id = format!("tg:{}", m.update_id);
+    match store.enqueue(&id, &m.chat_id, &prompt, Some(&conversation), capacity) {
+        Ok(true) => {
+            if let Some(notice) = queued_notice(store, &conversation, &id) {
+                let _ = rest.send_text(&m.chat_id, &notice).await;
+            }
+        }
+        Ok(false) => {}
         Err(_) => {
             let _ = rest
                 .send_text(

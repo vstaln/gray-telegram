@@ -182,11 +182,11 @@ fn write_executable(path: &Path, text: &str) {
 
 /// Both e2e tests retarget the Bot API through one process-global env var;
 /// the lock keeps their daemons from ever reading each other's base.
-static API_BASE_LOCK: Mutex<()> = Mutex::new(());
+static API_BASE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mock_bot_api_end_to_end() {
-    let _api_lock = API_BASE_LOCK.lock().unwrap();
+    let _api_lock = API_BASE_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -256,7 +256,8 @@ async fn mock_bot_api_end_to_end() {
     assert!(
         mock.wait_for(
             "sendMessage",
-            |b| b.get("text")
+            |b| b
+                .get("text")
                 .and_then(Value::as_str)
                 .is_some_and(|t| t.contains("E2E MOCK ANSWER")),
             20
@@ -323,7 +324,7 @@ async fn mock_bot_api_end_to_end() {
 /// `cmd interact` into an edited message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mock_bot_api_cmd_surface() {
-    let _api_lock = API_BASE_LOCK.lock().unwrap();
+    let _api_lock = API_BASE_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -379,7 +380,8 @@ echo '{"protocol":1,"turn_id":"t1","session_id":"sess-1","type":"result","text":
     assert!(
         mock.wait_for(
             "setMyCommands",
-            |b| b.get("commands")
+            |b| b
+                .get("commands")
                 .and_then(Value::as_array)
                 .is_some_and(|c| c.iter().any(|e| e["command"] == "model")),
             10
@@ -420,7 +422,8 @@ echo '{"protocol":1,"turn_id":"t1","session_id":"sess-1","type":"result","text":
     assert!(
         mock.wait_for(
             "editMessageText",
-            |b| b.get("text")
+            |b| b
+                .get("text")
                 .and_then(Value::as_str)
                 .is_some_and(|t| t.contains("Model set to claude")),
             20
@@ -435,7 +438,11 @@ echo '{"protocol":1,"turn_id":"t1","session_id":"sess-1","type":"result","text":
     let store = crate::gateway::open_store(&cfg_path).unwrap();
     assert!(
         store
-            .cmd_doc_get("tok-e2e", crate::graycmd::DOC_TTL_SECS, crate::durable::now_secs())
+            .cmd_doc_get(
+                "tok-e2e",
+                crate::graycmd::DOC_TTL_SECS,
+                crate::durable::now_secs()
+            )
             .unwrap()
             .is_none(),
         "closed picker document was not deleted"

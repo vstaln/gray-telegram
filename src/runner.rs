@@ -69,6 +69,70 @@ pub struct RunOpts<'a> {
     pub model: Option<String>,
 }
 
+type SharedStdin = std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
+
+fn live_stdins() -> &'static std::sync::Mutex<std::collections::HashMap<String, SharedStdin>> {
+    static LIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, SharedStdin>>,
+    > = std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+struct LiveStdin {
+    conversation: String,
+    stdin: SharedStdin,
+}
+
+impl LiveStdin {
+    fn register(conversation: &str, stdin: SharedStdin) -> Self {
+        if let Ok(mut live) = live_stdins().lock() {
+            live.insert(conversation.to_string(), stdin.clone());
+        }
+        Self {
+            conversation: conversation.to_string(),
+            stdin,
+        }
+    }
+}
+
+impl Drop for LiveStdin {
+    fn drop(&mut self) {
+        if let Ok(mut live) = live_stdins().lock() {
+            if live
+                .get(&self.conversation)
+                .is_some_and(|s| std::sync::Arc::ptr_eq(s, &self.stdin))
+            {
+                live.remove(&self.conversation);
+            }
+        }
+    }
+}
+
+pub fn is_live(conversation: &str) -> bool {
+    live_stdins()
+        .lock()
+        .map(|live| live.contains_key(conversation))
+        .unwrap_or(false)
+}
+
+pub async fn steer(conversation: &str, text: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let Some(stdin) = live_stdins()
+        .lock()
+        .ok()
+        .and_then(|live| live.get(conversation).cloned())
+    else {
+        return false;
+    };
+    let line = format!("{}\n", serde_json::json!({"type": "steer", "text": text}));
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+}
+
 pub fn default_opts() -> RunOpts<'static> {
     RunOpts::default()
 }
@@ -338,7 +402,7 @@ pub async fn run_gray_input(
     let mut cmd = tokio::process::Command::new(&args[0]);
     cmd.args(&args[1..]);
     cmd.current_dir(&work);
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
@@ -373,6 +437,7 @@ pub async fn run_gray_input(
     // Tool narration is safe to show; raw model reasoning is not.
     cmd.env("GRAY_SHOW_REASONING", "0");
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
+    cmd.env("GRAY_STDIN_STEER", "1");
     let mut child = cmd
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
@@ -382,6 +447,12 @@ pub async fn run_gray_input(
         .stdout
         .take()
         .ok_or_else(|| RunError::Spawn("no stdout".to_string()))?;
+    let _live = child.stdin.take().map(|s| {
+        LiveStdin::register(
+            conversation,
+            std::sync::Arc::new(tokio::sync::Mutex::new(s)),
+        )
+    });
 
     let mut progress_cb = ProgressCb {
         call: |ctx, row| {
@@ -607,6 +678,9 @@ async fn consume_ndjson(
                 continue;
             }
         };
+        if row.get("type").and_then(Value::as_str) == Some("retract") {
+            continue;
+        }
         if row.get("protocol").and_then(Value::as_i64) != Some(1) {
             protocol_ok = false;
             continue;

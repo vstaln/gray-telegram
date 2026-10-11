@@ -280,6 +280,17 @@ fn pager_kb(token: &str, cur: usize, total: usize) -> Value {
     ]]})
 }
 
+pub(crate) async fn send_paged(
+    rest: &crate::transport::Rest,
+    store: &crate::durable::Store,
+    chat_id: &str,
+    user_id: &str,
+    home: &Path,
+    text: &str,
+) {
+    send_result_text(rest, store, chat_id, user_id, home, text).await
+}
+
 async fn send_result_text(
     rest: &crate::transport::Rest,
     store: &crate::durable::Store,
@@ -921,6 +932,7 @@ pub fn help_text(list: Option<&CommandList>) -> String {
     let mut out = String::from("Commands:\n");
     out.push_str("  /new — start a fresh conversation\n");
     out.push_str("  /stop — cancel the running task\n");
+    out.push_str("  /steer <text> — guide the running task (idle: sent as a new message)\n");
     out.push_str("  /status — what the queue is doing\n");
     out.push_str("  /help — this text\n");
     let extra: Vec<&CmdSpec> = list
@@ -931,11 +943,7 @@ pub fn help_text(list: Option<&CommandList>) -> String {
     if !extra.is_empty() {
         out.push_str("\ngray commands:\n");
         for c in extra {
-            out.push_str(&format!(
-                "  /{} — {}\n",
-                crate::text::escape_html(&c.name),
-                crate::text::escape_html(&c.description)
-            ));
+            out.push_str(&format!("  /{} — {}\n", c.name, c.description));
         }
     }
     out.push_str("\nAttach a photo or document and I will hand it to the agent.");
@@ -949,6 +957,7 @@ pub fn command_menu(list: Option<&CommandList>) -> Vec<Value> {
         json!({"command": "start", "description": "connect to the bot"}),
         json!({"command": "new", "description": "start a fresh conversation"}),
         json!({"command": "stop", "description": "cancel the running task"}),
+        json!({"command": "steer", "description": "guide the running task"}),
         json!({"command": "status", "description": "queue depth and state"}),
         json!({"command": "help", "description": "what the bot can do"}),
     ];
@@ -1241,14 +1250,14 @@ mod tests {
         let list = CommandList::from_reply(&list_reply()).unwrap();
         let menu = command_menu(Some(&list));
         // 5 built-ins + model/usage (help dedupes, quit is local-only).
-        assert_eq!(menu.len(), 7);
+        assert_eq!(menu.len(), 8);
         assert!(menu.iter().all(|m| m["command"]
             .as_str()
             .unwrap()
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')));
         let fallback = command_menu(None);
-        assert_eq!(fallback.len(), 5);
+        assert_eq!(fallback.len(), 6);
     }
 
     #[test]

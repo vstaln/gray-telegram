@@ -20,13 +20,19 @@ pub enum BotCommand {
     New,
     /// `/stop` — cancel the running turn.
     Stop,
+    Steer {
+        text: String,
+    },
     /// `/status` — queue depth and gateway state.
     Status,
     /// `/help` — what the bot can do.
     Help,
     /// A `gray cmd`-registered command (`/model`, `/usage`, …): the name as
     /// the user typed it (aliases resolve server-side) and the raw args.
-    Gray { name: String, args: String },
+    Gray {
+        name: String,
+        args: String,
+    },
 }
 
 /// Parse `text` as a command. `bot_username` is lowercased without `@`.
@@ -54,6 +60,9 @@ pub fn parse(
         "start" => Some(BotCommand::Start),
         "new" | "reset" => Some(BotCommand::New),
         "stop" => Some(BotCommand::Stop),
+        "steer" => Some(BotCommand::Steer {
+            text: head[first.len()..].trim().to_string(),
+        }),
         "status" => Some(BotCommand::Status),
         "help" => Some(BotCommand::Help),
         _ => registry
@@ -68,6 +77,7 @@ pub fn parse(
 pub const HELP: &str = "I relay messages to a local gray agent.\n\n\
      /new — start a fresh conversation\n\
      /stop — cancel the running task\n\
+     /steer <text> — guide the running task (idle: sent as a new message)\n\
      /status — what the queue is doing\n\
      /help — this text\n\n\
      Attach a photo or document and I will hand it to the agent.";

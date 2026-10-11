@@ -39,9 +39,9 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auth(_) => f.write_str("Telegram authentication failed; check the bot token"),
-            Self::Forbidden(_) => {
-                f.write_str("Telegram refused the request; the bot may be blocked or removed from the chat")
-            }
+            Self::Forbidden(_) => f.write_str(
+                "Telegram refused the request; the bot may be blocked or removed from the chat",
+            ),
             Self::RateLimited(_) => f.write_str("Telegram rate limit hit; backing off"),
             Self::Http(status @ (400 | 413), detail) => {
                 write!(f, "Telegram rejected the request (HTTP {status}): {detail}")
@@ -100,10 +100,7 @@ impl Rest {
     pub fn new(base: &str, token: &str) -> Self {
         use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
         let mut headers = HeaderMap::new();
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static("gray-telegram/0.1"),
-        );
+        headers.insert(USER_AGENT, HeaderValue::from_static("gray-telegram/0.1"));
         // Every request is bounded. Without this a pooled connection that
         // died under us (a laptop's wifi, a NAT timeout) leaves a request
         // waiting forever, and the turn's messages freeze with it. Keepalive
@@ -209,10 +206,7 @@ impl Rest {
             }
         })?;
         let result = self.classify(resp).await?;
-        Ok(result
-            .as_array()
-            .map(|a| a.iter().cloned().collect())
-            .unwrap_or_default())
+        Ok(result.as_array().map(|a| a.to_vec()).unwrap_or_default())
     }
 
     /// `sendMessage` with HTML parse mode. A body Telegram cannot parse as
@@ -239,7 +233,11 @@ impl Rest {
         text: &str,
         markup: Value,
     ) -> Result<Value, TransportError> {
-        check_bounds(text, MAX_MESSAGE_LEN, "Message must contain 1-4096 characters")?;
+        check_bounds(
+            text,
+            MAX_MESSAGE_LEN,
+            "Message must contain 1-4096 characters",
+        )?;
         let mut params = json!({
             "chat_id": chat_id,
             "text": text,
@@ -269,7 +267,11 @@ impl Rest {
         text: &str,
         markup: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        check_bounds(text, MAX_MESSAGE_LEN, "Message must contain 1-4096 characters")?;
+        check_bounds(
+            text,
+            MAX_MESSAGE_LEN,
+            "Message must contain 1-4096 characters",
+        )?;
         let mut params = json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -332,22 +334,21 @@ impl Rest {
         if file_id.trim().is_empty() || file_id.len() > 256 {
             return Err(TransportError::Invalid("invalid file_id".into()));
         }
-        let result = self
-            .call("getFile", &json!({"file_id": file_id}))
-            .await?;
+        let result = self.call("getFile", &json!({"file_id": file_id})).await?;
         let path = result
             .get("file_path")
             .and_then(Value::as_str)
             .ok_or_else(|| TransportError::Invalid("getFile returned no path".into()))?;
-        let size = result
-            .get("file_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let size = result.get("file_size").and_then(Value::as_u64).unwrap_or(0);
         Ok((path.to_string(), size))
     }
 
     /// Download a `file_path` from the Bot API file endpoint, bounded.
-    pub async fn download(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>, TransportError> {
+    pub async fn download(
+        &self,
+        file_path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, TransportError> {
         if file_path.contains("..") || file_path.starts_with('/') {
             return Err(TransportError::Invalid("invalid file path".into()));
         }
@@ -409,8 +410,8 @@ impl Rest {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let bytes = std::fs::read(path)
-            .map_err(|_| TransportError::Invalid("cannot read file".into()))?;
+        let bytes =
+            std::fs::read(path).map_err(|_| TransportError::Invalid("cannot read file".into()))?;
         let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
