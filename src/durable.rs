@@ -187,12 +187,11 @@ impl Store {
             .map(str::to_string)
             .unwrap_or_else(|| format!("chat:{channel}"));
         with_conn(&self.path, |db| {
-            let dup: bool = optional(db.query_row(
-                "SELECT 1 FROM inbox WHERE id=?1",
-                params![id],
-                |_| Ok(true),
-            ))?
-            .is_some();
+            let dup: bool =
+                optional(
+                    db.query_row("SELECT 1 FROM inbox WHERE id=?1", params![id], |_| Ok(true)),
+                )?
+                .is_some();
             if dup {
                 return Ok(false);
             }
@@ -322,15 +321,24 @@ impl Store {
         if text.trim().is_empty() || text.len() > 200000 {
             return Err("Completed answer must contain 1-200000 characters".to_string());
         }
-        let chunks =
-            crate::text::split_message(text, crate::transport::MAX_MESSAGE_LEN - 48)
-                .map_err(|e| e.to_string())?;
-        let dropped_chars: usize = if chunks.len() > 8 {
-            chunks[7..].iter().map(|c| c.len()).sum()
+        let chunks = crate::text::split_message(text, crate::transport::MAX_MESSAGE_LEN - 48)
+            .map_err(|e| e.to_string())?;
+        let mut file_part: Option<PathBuf> = None;
+        let capped: Vec<String> = if chunks.len() <= 8 {
+            chunks
         } else {
-            0
+            let tail = chunks[7..].join("\n");
+            let dir = self
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("overflow");
+            std::fs::create_dir_all(&dir).map_err(|_| "cannot complete".to_string())?;
+            let file = dir.join(format!("{id}.txt"));
+            std::fs::write(&file, tail).map_err(|_| "cannot complete".to_string())?;
+            file_part = Some(file);
+            chunks[..7].to_vec()
         };
-        let capped = cap_chunks(chunks, dropped_chars);
         let receipt_text =
             serde_json::to_string(receipt).map_err(|_| "cannot encode receipt".to_string())?;
         with_conn(&self.path, |db| {
@@ -347,6 +355,17 @@ impl Store {
                 db.execute(
                     "INSERT INTO outbox(id,part,content) VALUES(?1,?2,?3)",
                     params![id, part as i64, chunk],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            }
+            if let Some(file) = file_part {
+                db.execute(
+                    "INSERT INTO outbox(id,part,content) VALUES(?1,?2,?3)",
+                    params![
+                        id,
+                        capped.len() as i64,
+                        format!("{}{}", crate::graycmd::FILE_PREFIX, file.display())
+                    ],
                 )
                 .map_err(|_| "cannot complete".to_string())?;
             }
@@ -590,7 +609,7 @@ impl Store {
         owner: &str,
         now: f64,
     ) -> Result<(), String> {
-        if token.is_empty() || token.len() > 128 || doc.len() > 65536 {
+        if token.is_empty() || token.len() > 128 || doc.len() > 262144 {
             return Err("invalid command document".to_string());
         }
         with_conn(&self.path, |db| {
@@ -606,7 +625,12 @@ impl Store {
 
     /// The document behind a callback token; `None` when it aged past
     /// `ttl_secs` (the row is deleted — an expired picker stays expired).
-    pub fn cmd_doc_get(&self, token: &str, ttl_secs: f64, now: f64) -> Result<Option<CmdDoc>, String> {
+    pub fn cmd_doc_get(
+        &self,
+        token: &str,
+        ttl_secs: f64,
+        now: f64,
+    ) -> Result<Option<CmdDoc>, String> {
         let row: Option<CmdDoc> = with_conn(&self.path, |db| {
             optional(db.query_row(
                 "SELECT doc,home,name,owner,created FROM cmd_docs WHERE token=?1",
@@ -642,17 +666,22 @@ impl Store {
     /// Drop pickers whose TTL lapsed; called beside `prune_terminal`.
     pub fn prune_cmd_docs(&self, ttl_secs: f64, now: f64) -> Result<(), String> {
         with_conn(&self.path, |db| {
-            db.execute("DELETE FROM cmd_docs WHERE created<?1", params![now - ttl_secs])
-                .map(|_| ())
-                .map_err(|_| "cannot prune command documents".to_string())
+            db.execute(
+                "DELETE FROM cmd_docs WHERE created<?1",
+                params![now - ttl_secs],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot prune command documents".to_string())
         })
     }
 
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, String> {
         with_conn(&self.path, |db| {
-            optional(db.query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
-                r.get(0)
-            }))
+            optional(
+                db.query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
+                    r.get(0)
+                }),
+            )
         })
     }
 
@@ -735,20 +764,6 @@ impl Store {
             Ok(ids.len())
         })
     }
-}
-
-/// Anti-flood (at most 8 parts): keep the first 7 chunks, replace the rest
-/// with a notice carrying the dropped character count.
-pub(crate) fn cap_chunks(chunks: Vec<String>, dropped_chars: usize) -> Vec<String> {
-    const MAX: usize = 8;
-    if chunks.len() <= MAX {
-        return chunks;
-    }
-    let mut kept = chunks.into_iter().take(MAX - 1).collect::<Vec<_>>();
-    kept.push(format!(
-        "\u{2026} (truncated, {dropped_chars} more characters not sent)"
-    ));
-    kept
 }
 
 /// A short random id for a scheduled job. Filled from `/dev/urandom` where

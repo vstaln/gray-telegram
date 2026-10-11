@@ -71,7 +71,12 @@ impl CommandList {
                     aliases: c
                         .get("aliases")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                     scope: c
                         .get("scope")
@@ -177,7 +182,9 @@ async fn cmd_json_t(
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
         let Some(k_str) = k.to_str() else { continue };
-        if k_str.starts_with("GRAY_") || k_str.starts_with("TELEGRAM_") || k_str.starts_with("OPENAI_")
+        if k_str.starts_with("GRAY_")
+            || k_str.starts_with("TELEGRAM_")
+            || k_str.starts_with("OPENAI_")
         {
             continue;
         }
@@ -220,7 +227,9 @@ enum Reply {
 
 fn envelope(v: Value) -> Result<Reply, String> {
     if v.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(Reply::Result(v.get("result").cloned().unwrap_or(Value::Null)));
+        return Ok(Reply::Result(
+            v.get("result").cloned().unwrap_or(Value::Null),
+        ));
     }
     let e = v.get("error").cloned().unwrap_or(Value::Null);
     Ok(Reply::Error {
@@ -238,7 +247,12 @@ fn envelope(v: Value) -> Result<Reply, String> {
 }
 
 /// The home a command runs in: its own scope decides.
-fn run_home(config: &Value, config_path: &Path, conversation: &str, scope: &str) -> Option<PathBuf> {
+fn run_home(
+    config: &Value,
+    config_path: &Path,
+    conversation: &str,
+    scope: &str,
+) -> Option<PathBuf> {
     if scope == "global" {
         return config
             .get("gray_home")
@@ -256,23 +270,84 @@ fn gray_bin(config: &Value) -> Option<PathBuf> {
     (!bin.is_empty()).then(|| PathBuf::from(bin))
 }
 
-/// Deliver a `kind:text` answer: markdown → HTML, split like any delivery.
-async fn send_result_text(rest: &crate::transport::Rest, chat_id: &str, text: &str) {
-    let body = if text.trim().is_empty() {
-        "Done.".to_string()
-    } else {
-        md_to_html(&crate::text::sanitize(text))
-    };
-    let chunks = crate::text::split_message(
-        &body,
-        crate::transport::MAX_MESSAGE_LEN - 48,
-    )
-    .unwrap_or_else(|_| vec![body.clone()]);
-    for chunk in chunks.iter().take(8) {
-        if let Err(e) = rest.send_text(chat_id, chunk).await {
+pub(crate) const FILE_PREFIX: &str = "FILE:";
+
+fn pager_kb(token: &str, cur: usize, total: usize) -> Value {
+    json!({"inline_keyboard": [[
+        {"text": "◀ Prev", "callback_data": format!("pg|{token}|{}", cur.saturating_sub(1))},
+        {"text": format!("Page {}/{}", cur + 1, total), "callback_data": format!("pg|{token}|{cur}")},
+        {"text": "Next ▶", "callback_data": format!("pg|{token}|{}", (cur + 1).min(total.saturating_sub(1)))},
+    ]]})
+}
+
+async fn send_result_text(
+    rest: &crate::transport::Rest,
+    store: &crate::durable::Store,
+    chat_id: &str,
+    user_id: &str,
+    home: &Path,
+    text: &str,
+) {
+    let limit = crate::transport::MAX_MESSAGE_LEN - 48;
+    if text.trim().is_empty() {
+        let _ = rest.send_text(chat_id, "Done.").await;
+        return;
+    }
+    let body = md_to_html(&crate::text::sanitize(text));
+    if crate::text::utf16_len(&body) <= limit {
+        if let Err(e) = rest.send_text(chat_id, &body).await {
             eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
-            break;
         }
+        return;
+    }
+    let mut budget = limit - 24;
+    let pages: Vec<String> = loop {
+        let rendered: Vec<String> = crate::text::paginate_markdown(text, budget)
+            .into_iter()
+            .map(|page| md_to_html(&crate::text::sanitize(&page)))
+            .collect();
+        if rendered.iter().all(|p| crate::text::utf16_len(p) <= limit) {
+            break rendered;
+        }
+        if budget <= 128 {
+            break rendered
+                .into_iter()
+                .flat_map(|p| crate::text::split_message(&p, limit).unwrap_or_else(|_| vec![p]))
+                .collect();
+        }
+        budget /= 2;
+    };
+    if pages.len() <= 1 {
+        if let Err(e) = rest.send_text(chat_id, &body).await {
+            eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
+        }
+        return;
+    }
+    let token = crate::durable::uuid_hex();
+    let doc = json!({"kind": "pager", "pages": &pages});
+    if store
+        .cmd_doc_put(
+            &token,
+            &doc.to_string(),
+            &home.to_string_lossy(),
+            "pager",
+            user_id,
+            crate::durable::now_secs(),
+        )
+        .is_err()
+    {
+        let _ = rest.send_text(chat_id, &pages[0]).await;
+        let dir = home.join("overflow");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join(format!("reply-{token}.txt"));
+        if std::fs::write(&file, text).is_ok() {
+            let _ = rest.send_document(chat_id, &file, None).await;
+        }
+        return;
+    }
+    let kb = pager_kb(&token, 0, pages.len());
+    if let Err(e) = rest.send_markup(chat_id, &pages[0], &kb).await {
+        eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
     }
 }
 
@@ -293,7 +368,7 @@ async fn send_ui(
     let Some((body, markup)) = compile(document, token) else {
         // Buttons would not fit callback_data or the doc is off-shape:
         // the numbered-menu fallback is the component-less render.
-        send_result_text(rest, chat_id, fallback).await;
+        send_result_text(rest, store, chat_id, user_id, home, fallback).await;
         return;
     };
     let doc_json = serde_json::to_string(document).unwrap_or_default();
@@ -338,12 +413,20 @@ pub async fn dispatch(
         .and_then(|list| list.lookup(name).cloned());
     if spec.as_ref().map(|s| s.surface.as_str()) == Some("local") {
         let _ = rest
-            .send_text(chat_id, "That command only works in gray's local interface.")
+            .send_text(
+                chat_id,
+                "That command only works in gray's local interface.",
+            )
             .await;
         return;
     }
-    let scope = spec.as_ref().map(|s| s.scope.as_str()).unwrap_or("conversation");
-    let Some(home) = run_home(config, config_path, conversation, scope) else { return };
+    let scope = spec
+        .as_ref()
+        .map(|s| s.scope.as_str())
+        .unwrap_or("conversation");
+    let Some(home) = run_home(config, config_path, conversation, scope) else {
+        return;
+    };
     {
         use std::os::unix::fs::DirBuilderExt;
         let _ = std::fs::DirBuilder::new()
@@ -387,10 +470,7 @@ pub async fn dispatch(
         Ok(Reply::Result(result)) => {
             match result.get("kind").and_then(Value::as_str) {
                 Some("prompt") => {
-                    let prompt = result
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let prompt = result.get("prompt").and_then(Value::as_str).unwrap_or("");
                     let fallback = result
                         .get("fallback_text")
                         .and_then(Value::as_str)
@@ -400,18 +480,13 @@ pub async fn dispatch(
                         .and_then(Value::as_u64)
                         .unwrap_or(1000);
                     let id = format!("tg:cmd:{}", crate::durable::uuid_hex());
-                    let text = match store.enqueue(
-                        &id,
-                        chat_id,
-                        prompt,
-                        Some(conversation),
-                        capacity,
-                    ) {
-                        Ok(true) if fallback.trim().is_empty() => "Working on it.".to_string(),
-                        Ok(true) => crate::text::escape_html(fallback),
-                        Ok(false) => "That turn is already queued.".to_string(),
-                        Err(e) => crate::text::escape_html(&e),
-                    };
+                    let text =
+                        match store.enqueue(&id, chat_id, prompt, Some(conversation), capacity) {
+                            Ok(true) if fallback.trim().is_empty() => "Working on it.".to_string(),
+                            Ok(true) => crate::text::escape_html(fallback),
+                            Ok(false) => "That turn is already queued.".to_string(),
+                            Err(e) => crate::text::escape_html(&e),
+                        };
                     let _ = rest.send_text(chat_id, &text).await;
                 }
                 Some("ui") => {
@@ -422,25 +497,14 @@ pub async fn dispatch(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     send_ui(
-                        rest,
-                        store,
-                        chat_id,
-                        user_id,
-                        &home,
-                        name,
-                        token,
-                        &document,
-                        fallback,
+                        rest, store, chat_id, user_id, &home, name, token, &document, fallback,
                     )
                     .await;
                 }
                 _ => {
                     // kind "text" (or a missing kind): the text render.
-                    let text = result
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    send_result_text(rest, chat_id, text).await;
+                    let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+                    send_result_text(rest, store, chat_id, user_id, &home, text).await;
                 }
             }
         }
@@ -484,6 +548,53 @@ pub async fn callback(
             let _ = rest.answer_callback(&cb_id, text.as_deref(), alert).await;
         }
     };
+
+    if data.starts_with("pg|") {
+        let mut parts = data.split('|');
+        let (Some("pg"), Some(tok), Some(idx), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            toast(Some("Unknown action."), false).await;
+            return;
+        };
+        if !crate::policy::is_allowed_user(&from_id, owner_id, allowed) {
+            toast(Some("This pager is not for you."), true).await;
+            return;
+        }
+        let row = match store.cmd_doc_get(tok, DOC_TTL_SECS, crate::durable::now_secs()) {
+            Ok(Some(row)) => row,
+            _ => {
+                toast(Some("Pager expired — send the command again."), false).await;
+                return;
+            }
+        };
+        if row.owner != from_id {
+            toast(Some("This pager belongs to someone else."), true).await;
+            return;
+        }
+        let doc: Value = serde_json::from_str(&row.doc).unwrap_or(Value::Null);
+        let pages: Vec<&str> = doc
+            .get("pages")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let Some(&page) = idx
+            .parse::<usize>()
+            .ok()
+            .filter(|_| !pages.is_empty())
+            .and_then(|i| pages.get(i.min(pages.len() - 1)))
+        else {
+            toast(Some("That page is no longer there."), false).await;
+            return;
+        };
+        let cur = idx.parse::<usize>().unwrap_or(0).min(pages.len() - 1);
+        let kb = pager_kb(tok, cur, pages.len());
+        let _ = rest
+            .edit_message(&chat_id, message_id, page, Some(&kb))
+            .await;
+        toast(None, false).await;
+        return;
+    }
 
     let mut parts = data.split('|');
     let (Some("gc"), Some(tok), Some(a), Some(b), None) = (
@@ -553,18 +664,14 @@ pub async fn callback(
         },
         Ok(Reply::Result(result)) => match result.get("kind").and_then(Value::as_str) {
             Some("prompt") => {
-                let prompt = result
-                    .get("prompt")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let prompt = result.get("prompt").and_then(Value::as_str).unwrap_or("");
                 let fallback = result
                     .get("fallback_text")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let is_private =
                     msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
-                let conv =
-                    crate::session::conversation_key(&chat_id, &from_id, is_private);
+                let conv = crate::session::conversation_key(&chat_id, &from_id, is_private);
                 let capacity = config
                     .get("queue_capacity")
                     .and_then(Value::as_u64)
@@ -593,10 +700,7 @@ pub async fn callback(
                 let document = result.get("document").cloned().unwrap_or(Value::Null);
                 // Editable docs keep their token, but if core ever hands a
                 // fresh one the picker must re-key or the next press misses.
-                let next_tok = result
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .unwrap_or(tok);
+                let next_tok = result.get("token").and_then(Value::as_str).unwrap_or(tok);
                 let fallback = result
                     .get("fallback_text")
                     .and_then(Value::as_str)
@@ -610,12 +714,7 @@ pub async fn callback(
                         };
                         let doc_json = serde_json::to_string(&document).unwrap_or_default();
                         let _ = store.cmd_doc_put(
-                            next_tok,
-                            &doc_json,
-                            &row.home,
-                            &row.name,
-                            &row.owner,
-                            now,
+                            next_tok, &doc_json, &row.home, &row.name, &row.owner, now,
                         );
                         if next_tok != tok {
                             let _ = store.cmd_doc_delete(tok);
@@ -628,7 +727,12 @@ pub async fn callback(
                     None => {
                         let _ = store.cmd_doc_delete(tok);
                         let _ = rest
-                            .edit_message(&chat_id, message_id, &md_to_html(fallback), Some(&empty_kb))
+                            .edit_message(
+                                &chat_id,
+                                message_id,
+                                &md_to_html(fallback),
+                                Some(&empty_kb),
+                            )
                             .await;
                         toast(None, false).await;
                     }
@@ -726,8 +830,10 @@ fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
                 for child in children {
                     match child.get("type").and_then(Value::as_str) {
                         Some("string_select") => {
-                            let lid =
-                                child.get("logical_id").and_then(Value::as_str).unwrap_or("");
+                            let lid = child
+                                .get("logical_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
                             let options = child
                                 .get("options")
                                 .and_then(Value::as_array)
@@ -750,18 +856,21 @@ fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
                                     }
                                     _ => truncate(&label, 80),
                                 };
-                                let label = if opt.get("default").and_then(Value::as_bool) == Some(true) {
-                                    format!("• {label}")
-                                } else {
-                                    label
-                                };
+                                let label =
+                                    if opt.get("default").and_then(Value::as_bool) == Some(true) {
+                                        format!("• {label}")
+                                    } else {
+                                        label
+                                    };
                                 let data = cb_data(token, lid, &i.to_string())?;
                                 rows.push(json!([{"text": label, "callback_data": data}]));
                             }
                         }
                         Some("button") => {
-                            let lid =
-                                child.get("logical_id").and_then(Value::as_str).unwrap_or("");
+                            let lid = child
+                                .get("logical_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
                             let label = child
                                 .get("label")
                                 .and_then(Value::as_str)
@@ -777,7 +886,8 @@ fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
                                 continue;
                             }
                             let data = cb_data(token, "s", lid)?;
-                            buttons.push(json!({"text": truncate(&label, 64), "callback_data": data}));
+                            buttons
+                                .push(json!({"text": truncate(&label, 64), "callback_data": data}));
                         }
                         _ => {}
                     }
@@ -947,7 +1057,11 @@ fn delim(s: &str, d: &str, open: &str, close: &str, wordy: bool) -> String {
     for (n, at) in marks.iter().enumerate() {
         out.push_str(&s[cursor..*at]);
         out.push_str(if n < pairs {
-            if n % 2 == 0 { open } else { close }
+            if n % 2 == 0 {
+                open
+            } else {
+                close
+            }
         } else {
             d
         });
@@ -991,7 +1105,9 @@ fn links(s: &str) -> String {
             rest = &rest[i + 2..];
             continue;
         };
-        let Some(k) = rest[i + 2..].find(')') else { break };
+        let Some(k) = rest[i + 2..].find(')') else {
+            break;
+        };
         out.push_str(&rest[..j]);
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
@@ -1126,7 +1242,9 @@ mod tests {
         let menu = command_menu(Some(&list));
         // 5 built-ins + model/usage (help dedupes, quit is local-only).
         assert_eq!(menu.len(), 7);
-        assert!(menu.iter().all(|m| m["command"].as_str().unwrap()
+        assert!(menu.iter().all(|m| m["command"]
+            .as_str()
+            .unwrap()
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')));
         let fallback = command_menu(None);

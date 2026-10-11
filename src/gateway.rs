@@ -59,10 +59,7 @@ fn inbound(update: &Value, bot_username: &str, bot_id: &str) -> Option<Inbound> 
     let is_private = chat_type == "private";
     let from = msg.get("from").cloned().unwrap_or(Value::Null);
     let user_id = from.get("id").and_then(Value::as_i64)?.to_string();
-    let is_bot = from
-        .get("is_bot")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_bot = from.get("is_bot").and_then(Value::as_bool).unwrap_or(false);
     let mut text = msg
         .get("text")
         .and_then(Value::as_str)
@@ -114,7 +111,10 @@ fn inbound(update: &Value, bot_username: &str, bot_id: &str) -> Option<Inbound> 
                     .unwrap_or(false)
             })
         })
-        .unwrap_or_else(|| text.to_ascii_lowercase().contains(&format!("@{}", bot_username.to_ascii_lowercase())));
+        .unwrap_or_else(|| {
+            text.to_ascii_lowercase()
+                .contains(&format!("@{}", bot_username.to_ascii_lowercase()))
+        });
     let reply_to_bot = msg
         .get("reply_to_message")
         .and_then(|r| r.get("from"))
@@ -266,7 +266,8 @@ impl<R, D> Runtime<R, D> {
                     .send_text(
                         channel,
                         &crate::text::escape_html(&format!(
-                            "[could not deliver file: {}]", upload.name
+                            "[could not deliver file: {}]",
+                            upload.name
                         )),
                     )
                     .await;
@@ -277,7 +278,12 @@ impl<R, D> Runtime<R, D> {
     /// Run claimed turns until the queue drains. `Ok(false)` means "idle".
     pub async fn generate_one(&self) -> Result<bool, String>
     where
-        R: Fn(&Value, &Path, &str, &RunInput) -> std::pin::Pin<
+        R: Fn(
+                &Value,
+                &Path,
+                &str,
+                &RunInput,
+            ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<String, RunError>> + Send>,
             > + Send
             + Sync,
@@ -320,14 +326,12 @@ impl<R, D> Runtime<R, D> {
         };
         match result {
             Ok(answer) => {
-                let (prose, media) = crate::media_tags::extract(
-                    &answer,
-                    &self.media_cwd(),
-                    &self.media_roots(),
-                );
+                let (prose, media) =
+                    crate::media_tags::extract(&answer, &self.media_cwd(), &self.media_roots());
                 let receipt = serde_json::json!({});
                 if prose.trim().is_empty() {
-                    self.store.complete(&item.id, "(no text answer)", &receipt)?;
+                    self.store
+                        .complete(&item.id, "(no text answer)", &receipt)?;
                 } else {
                     self.store.complete(&item.id, &prose, &receipt)?;
                 }
@@ -342,7 +346,9 @@ impl<R, D> Runtime<R, D> {
 
     pub async fn deliver_one(&self) -> Result<bool, String>
     where
-        D: Fn(OutboxPart) -> std::pin::Pin<
+        D: Fn(
+                OutboxPart,
+            ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
             > + Send
             + Sync,
@@ -360,7 +366,10 @@ impl<R, D> Runtime<R, D> {
                     .delivery_failed(&part, "delivery_failed", self.now_secs())?;
             }
             Err(e) => {
-                eprintln!("[telegram] delivery of {} part {} failed: {e}", part.id, part.part);
+                eprintln!(
+                    "[telegram] delivery of {} part {} failed: {e}",
+                    part.id, part.part
+                );
                 self.store
                     .delivery_failed(&part, "delivery_failed", self.now_secs())?;
             }
@@ -486,7 +495,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         eprintln!("[telegram] deleteWebhook failed: {e}");
     }
     let me = rest.get_me().await.map_err(|e| e.to_string())?;
-    let bot_id = me.get("id").and_then(Value::as_i64).unwrap_or(0).to_string();
+    let bot_id = me
+        .get("id")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .to_string();
     let bot_username = me
         .get("username")
         .and_then(Value::as_str)
@@ -520,15 +533,12 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             .unwrap_or("gray"),
     );
     if crate::lifecycle::enabled(&config) {
-        if let Some(notice) =
-            crate::lifecycle::boot_via(&gray_bin, &dir, running_before).await
-        {
-            let home = config
-                .get("chat_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+        if let Some(notice) = crate::lifecycle::boot_via(&gray_bin, &dir, running_before).await {
+            let home = config.get("chat_id").and_then(Value::as_str).unwrap_or("");
             if !home.is_empty() {
-                let _ = rest.send_text(home, &crate::text::escape_html(&notice)).await;
+                let _ = rest
+                    .send_text(home, &crate::text::escape_html(&notice))
+                    .await;
             }
         }
     }
@@ -537,8 +547,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     let deliver = move |part: OutboxPart| {
         let rest = rest_del.clone();
         Box::pin(async move {
-            let text = crate::text::sanitize(&part.content);
-            let result = rest.send_text(&part.channel, &text).await;
+            let result = if let Some(path) = part.content.strip_prefix(crate::graycmd::FILE_PREFIX)
+            {
+                rest.send_document(&part.channel, Path::new(path), None)
+                    .await
+            } else {
+                let text = crate::text::sanitize(&part.content);
+                rest.send_text(&part.channel, &text).await
+            };
             match result {
                 Ok(v) => v
                     .get("message_id")
@@ -568,14 +584,18 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             crate::runner::run_gray_input(&cfg, &pth, &conv, input, crate::runner::default_opts())
                 .await
         })
-            as std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<String, RunError>> + Send>,
-            >
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, RunError>> + Send>>
     };
 
     let runtime = std::sync::Arc::new(
-        Runtime::new(config.clone(), config_path.to_path_buf(), store.clone(), deliver, runner)
-            .with_rest(rest.clone()),
+        Runtime::new(
+            config.clone(),
+            config_path.to_path_buf(),
+            store.clone(),
+            deliver,
+            runner,
+        )
+        .with_rest(rest.clone()),
     );
 
     // Workers: `concurrency` generators, one delivery pump, one schedule
@@ -650,7 +670,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     tokio::pin!(sigterm_recv);
 
     if owner_id.is_empty() {
-        println!("Telegram connected as @{bot_username}; nobody admitted yet (pairing replies only).");
+        println!(
+            "Telegram connected as @{bot_username}; nobody admitted yet (pairing replies only)."
+        );
     } else {
         println!("Telegram connected as @{bot_username}; durable allowlisted queue enabled.");
     }
@@ -801,7 +823,10 @@ async fn handle_inbound(
                     send_pairing(store, rest, m).await;
                 } else {
                     let _ = rest
-                        .send_text(&m.chat_id, "Connected to gray. Send a message and I will run it.")
+                        .send_text(
+                            &m.chat_id,
+                            "Connected to gray. Send a message and I will run it.",
+                        )
                         .await;
                 }
             }
@@ -963,9 +988,10 @@ fn runtime_home(config_path: &Path, conversation: &str) -> Option<PathBuf> {
     // The same layout `run_gray` builds: conversations live beside the
     // config file, keyed by sha256 of the conversation key.
     let base = config_path.parent()?;
-    Some(base.join("conversations").join(crate::runner::hex_sha256(
-        conversation.as_bytes(),
-    )))
+    Some(
+        base.join("conversations")
+            .join(crate::runner::hex_sha256(conversation.as_bytes())),
+    )
 }
 
 /// An unadmitted human in a private chat gets the pairing reply; everyone

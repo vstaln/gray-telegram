@@ -23,6 +23,72 @@ pub fn split_message(s: &str, limit: usize) -> Result<Vec<String>, String> {
     Ok(chunks)
 }
 
+/// Split markdown at line boundaries into `limit`-UTF-16-unit pages;
+/// ``` fences are closed at a page end and reopened on the next.
+pub fn paginate_markdown(text: &str, limit: usize) -> Vec<String> {
+    let mut pages: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut fence: Option<String> = None;
+    let close = |pages: &mut Vec<String>, cur: &mut String, fence: &Option<String>| {
+        let mut page = std::mem::take(cur);
+        if let Some(lang) = fence {
+            page.push_str("\n```");
+            *cur = format!("```{lang}");
+        }
+        pages.push(page);
+    };
+    for line in text.split('\n') {
+        if utf16_len(line) > limit {
+            if !cur.is_empty() {
+                close(&mut pages, &mut cur, &fence);
+            }
+            let mut rest = line;
+            while utf16_len(rest) > limit {
+                let cut = rest
+                    .char_indices()
+                    .scan(0usize, |used, (i, c)| {
+                        *used += c.len_utf16();
+                        Some((i + c.len_utf8(), *used))
+                    })
+                    .take_while(|(_, w)| *w <= limit)
+                    .last()
+                    .map(|(end, _)| end)
+                    .unwrap_or(0);
+                match &fence {
+                    Some(lang) => pages.push(format!("```{lang}\n{}\n```", &rest[..cut])),
+                    None => pages.push(rest[..cut].to_string()),
+                }
+                rest = &rest[cut..];
+            }
+            cur = match &fence {
+                Some(lang) => format!("```{lang}\n{rest}"),
+                None => rest.to_string(),
+            };
+        } else {
+            let join = if cur.is_empty() { 0 } else { 1 };
+            if !cur.is_empty() && utf16_len(&cur) + join + utf16_len(line) > limit {
+                close(&mut pages, &mut cur, &fence);
+            }
+            if !cur.is_empty() {
+                cur.push('\n');
+            }
+            cur.push_str(line);
+        }
+        let t = line.trim_start();
+        if let Some(marker) = t.strip_prefix("```") {
+            fence = if fence.is_none() {
+                Some(marker.trim().to_string())
+            } else {
+                None
+            };
+        }
+    }
+    if !cur.is_empty() || pages.is_empty() {
+        pages.push(cur);
+    }
+    pages
+}
+
 /// Longest prefix of `s` (on a char boundary) within `limit` UTF-16 units.
 pub fn prefix_within_limit(s: &str, limit: usize) -> &str {
     if utf16_len(s) <= limit {
