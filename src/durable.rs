@@ -409,18 +409,14 @@ impl Store {
         })
     }
 
-    pub fn fail(&self, id: &str, code: &str) -> Result<(), String> {
+    pub fn fail(&self, id: &str, code: &str, reason: &str) -> Result<(), String> {
         let code = match code {
             "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,
             _ => "agent_failed",
         };
         // `interrupted` only comes from boot recovery: the gateway stopped
         // mid-turn, so say that instead of a bare code.
-        let notice = if code == "interrupted" {
-            format!("Turn {id}: interrupted because the gateway stopped mid-turn. Actions may already have happened; send a message to continue.")
-        } else {
-            format!("Turn {id}: {code}. Actions may already have happened; no automatic retry.")
-        };
+        let notice = failure_notice(code, reason);
         with_conn(&self.path, |db| {
             db.execute(
                 "UPDATE inbox SET state='uncertain',error=?1 WHERE id=?2 AND state='running'",
@@ -463,7 +459,7 @@ impl Store {
                 .map_err(|_| "cannot recover".to_string())
         })?;
         for id in ids {
-            self.fail(&id, "interrupted")?;
+            self.fail(&id, "interrupted", "")?;
         }
         Ok(())
     }
@@ -799,6 +795,26 @@ impl Store {
             }
             Ok(ids.len())
         })
+    }
+}
+
+pub fn failure_notice(code: &str, reason: &str) -> String {
+    const STEPS: &str = "Some steps may already have run.";
+    match code {
+        "cancelled" => format!("Stopped. {STEPS}"),
+        "interrupted" => {
+            format!("Stopped: the gateway restarted mid-turn. {STEPS} Send a message to try again.")
+        }
+        _ => {
+            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+            let reason = crate::text::escape_html(&reason.chars().take(300).collect::<String>());
+            let lead = if code == "timeout" {
+                "Gave up"
+            } else {
+                "That failed"
+            };
+            format!("{lead}: {reason}. {STEPS} Send a message to try again.")
+        }
     }
 }
 

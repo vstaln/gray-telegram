@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Local, TimeZone, Timelike};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResetReason {
@@ -119,8 +119,23 @@ pub fn conversation_key(chat_id: &str, user_id: &str, is_private: bool) -> Strin
 /// flight during `/new` from restoring its old session pointer when it exits.
 pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     let sessions = home.join("sessions");
+    let mut transcripts = Vec::new();
     if sessions.is_dir() {
-        clear_jsonl(&sessions)?;
+        collect_transcripts(&sessions, &mut transcripts)?;
+    }
+    if !transcripts.is_empty() {
+        let archive = archive_dir(&home.join("sessions-archive"), now)?;
+        for path in transcripts {
+            let rel = path
+                .strip_prefix(&sessions)
+                .map_err(|_| "cannot archive conversation session".to_string())?;
+            let target = archive.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| "cannot archive conversation session".to_string())?;
+            }
+            move_file(&path, &target)?;
+        }
     }
     let state = json!({
         "generation": crate::durable::uuid_hex(),
@@ -129,7 +144,7 @@ pub fn reset_home(home: &Path, now: f64) -> Result<(), String> {
     crate::config::atomic_json(&home.join("session.json"), &state)
 }
 
-fn clear_jsonl(dir: &Path) -> Result<(), String> {
+fn collect_transcripts(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|_| "cannot list conversation sessions".to_string())?;
     for entry in entries {
@@ -139,13 +154,40 @@ fn clear_jsonl(dir: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|_| "cannot inspect conversation session".to_string())?;
         if file_type.is_dir() {
-            clear_jsonl(&path)?;
+            collect_transcripts(&path, out)?;
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            std::fs::remove_file(path)
-                .map_err(|_| "cannot clear conversation session".to_string())?;
+            out.push(path);
         }
     }
     Ok(())
+}
+
+fn archive_dir(root: &Path, now: f64) -> Result<PathBuf, String> {
+    let stamp = local_at(now)
+        .map(|t| t.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| (now as i64).to_string());
+    std::fs::create_dir_all(root).map_err(|_| "cannot create session archive".to_string())?;
+    let mut name = stamp.clone();
+    let mut n = 2;
+    loop {
+        let dir = root.join(&name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!("{stamp}-{n}");
+                n += 1;
+            }
+            Err(_) => return Err("cannot create session archive".to_string()),
+        }
+    }
+}
+
+fn move_file(from: &Path, to: &Path) -> Result<(), String> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to).map_err(|_| "cannot archive conversation session".to_string())?;
+    std::fs::remove_file(from).map_err(|_| "cannot archive conversation session".to_string())
 }
 
 /// True when the on-disk state still belongs to the same conversation

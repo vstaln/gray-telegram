@@ -357,7 +357,7 @@ impl<R, D> Runtime<R, D> {
             }
         };
         let Some(result) = result else {
-            self.store.fail(&item.id, "cancelled")?;
+            self.store.fail(&item.id, "cancelled", "")?;
             return Ok(true);
         };
         match result {
@@ -381,9 +381,14 @@ impl<R, D> Runtime<R, D> {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(item.conversation.clone(), until);
             }
-            Err(RunError::Budget(_)) => self.store.fail(&item.id, "budget_blocked")?,
-            Err(RunError::Timeout) => self.store.fail(&item.id, "timeout")?,
-            Err(RunError::RequestLimit(_)) | Err(_) => self.store.fail(&item.id, "agent_failed")?,
+            Err(RunError::Budget(e)) => {
+                self.store
+                    .fail(&item.id, "budget_blocked", &e.to_string())?
+            }
+            Err(e @ RunError::Timeout(_)) => {
+                self.store.fail(&item.id, "timeout", &e.to_string())?
+            }
+            Err(e) => self.store.fail(&item.id, "agent_failed", &e.to_string())?,
         }
         Ok(true)
     }
@@ -477,6 +482,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| "provider model is missing".to_string())?;
+    let model = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(model);
     config["budget_required"] = Value::Bool(crate::budget::gate(&config, model)?);
 
     let store = open_store(config_path)?;

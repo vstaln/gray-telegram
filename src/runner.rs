@@ -14,7 +14,8 @@ const LINE_CAP: usize = 1024 * 1024;
 pub enum RunError {
     Busy,
     Budget(BudgetBlocked),
-    Timeout,
+    Timeout(u64),
+    Agent(String),
     /// The turn used all `max_requests` provider requests and was stopped.
     RequestLimit(u64),
     Spawn(String),
@@ -30,23 +31,20 @@ impl std::fmt::Display for RunError {
         match self {
             Self::Busy => f.write_str("This conversation is busy"),
             Self::Budget(e) => write!(f, "{e}"),
-            Self::Timeout => f.write_str("gray turn timed out"),
+            Self::Timeout(secs) if secs.is_multiple_of(60) => {
+                write!(f, "the turn ran past its {}m limit", secs / 60)
+            }
+            Self::Timeout(secs) => write!(f, "the turn ran past its {secs}s limit"),
             Self::RequestLimit(n) => write!(f, "gray turn hit its {n}-request limit"),
+            Self::Agent(message) => f.write_str(message),
             Self::Spawn(_) => f.write_str("cannot start gray agent"),
             Self::Protocol(_) => {
-                f.write_str("Invalid agent JSON output; upgrade gray to a compatible version")
+                f.write_str("invalid agent JSON output; upgrade gray to a compatible version")
             }
-            Self::Exit(Some(n)) => write!(
-                f,
-                "gray exited with code {n}; not retrying possible side effects"
-            ),
-            Self::Exit(None) => {
-                f.write_str("gray exited without a status; not retrying possible side effects")
-            }
-            Self::Incomplete => f.write_str(
-                "Agent did not return a completed result; actions may already have occurred",
-            ),
-            Self::Empty => f.write_str("Agent returned no final answer"),
+            Self::Exit(Some(n)) => write!(f, "gray exited with code {n}"),
+            Self::Exit(None) => f.write_str("gray exited without a status"),
+            Self::Incomplete => f.write_str("the agent did not return a completed result"),
+            Self::Empty => f.write_str("the agent returned no final answer"),
             Self::Io(_) => f.write_str("gray turn failed; check connectivity"),
         }
     }
@@ -229,10 +227,17 @@ pub async fn run_gray_input(
         .get("gray_home")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
+    let mut provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| RunError::Io("gray provider configuration is missing".to_string()))?;
+    if let Some(model) = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        provider["model"] = Value::String(model.to_string());
+    }
     crate::config::atomic_json(&home.join("config.json"), &provider).map_err(RunError::Io)?;
 
     // Dedicated workdir/profile: no lockfile plugins that might start
@@ -425,6 +430,9 @@ pub async fn run_gray_input(
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    if !gray_home.is_empty() {
+        cmd.env("GRAY_USER_HOME", gray_home);
+    }
     cmd.env(
         "PATH",
         child_path(
@@ -485,7 +493,7 @@ pub async fn run_gray_input(
                     }
                 }
                 let _ = child.wait().await;
-                return Err(RunError::Timeout);
+                return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child
@@ -512,6 +520,13 @@ pub async fn run_gray_input(
     if let Some(row) = consumed.terminal.as_ref().filter(|r| r["type"] == "error") {
         if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
             return Err(RunError::RequestLimit(max_requests));
+        }
+        if let Some(message) = row
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        {
+            return Err(RunError::Agent(message.to_string()));
         }
     }
     if !status.success() {
