@@ -818,17 +818,37 @@ pub fn failure_notice(code: &str, reason: &str) -> String {
     }
 }
 
-/// A short random id for a scheduled job. Filled from `/dev/urandom` where
-/// that exists.
-pub fn uuid_hex() -> String {
-    let mut buf = [0u8; 16];
+
+/// Fill `buf` from `/dev/urandom` where it exists; elsewhere mix pid +
+/// time + RandomState so ids and pairing codes still differ.
+pub(crate) fn fill_entropy(buf: &mut [u8]) {
     #[cfg(unix)]
     {
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut buf);
+        if std::fs::File::open("/dev/urandom")
+            .map(|mut f| f.read_exact(buf).is_ok())
+            .unwrap_or(false)
+        {
+            return;
         }
     }
+    use std::hash::{BuildHasher, Hasher};
+    for (i, chunk) in buf.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_usize(i);
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            h.write_u128(d.as_nanos());
+        }
+        let bytes = h.finish().to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
+/// A short random id for a scheduled job.
+pub fn uuid_hex() -> String {
+    let mut buf = [0u8; 16];
+    crate::durable::fill_entropy(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

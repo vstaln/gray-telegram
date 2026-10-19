@@ -173,11 +173,17 @@ async fn cmd_json_t(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
@@ -206,9 +212,7 @@ async fn cmd_json_t(
         Ok(Err(_)) => return Err("gray cmd failed".to_string()),
         Err(_) => {
             if pid != 0 {
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
+                crate::runner::kill_process_tree(pid);
             }
             return Err("gray cmd timed out".to_string());
         }
@@ -439,11 +443,14 @@ pub async fn dispatch(
         return;
     };
     {
-        use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&home);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        let _ = builder.create(&home);
     }
 
     let mut argv: Vec<&str> = vec!["run", name];
