@@ -2,7 +2,6 @@
 //! Session/work state stays separate; this is not a sandbox.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Context cap: 128 KiB total across all shared context files.
@@ -18,9 +17,19 @@ pub fn absolute(v: &str) -> Result<PathBuf, String> {
 }
 
 /// Single-quote shell escaping (shlex.join parity for one argv array).
+#[cfg(unix)]
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Double-quote argv for a `.cmd` launcher on Windows.
+#[cfg(windows)]
+fn cmd_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| format!("\"{}\"", a.replace('"', "")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -29,12 +38,21 @@ fn shell_join(argv: &[String]) -> String {
 /// launchers for shared plugins. Returns the `work/gray.yml` profile lines.
 pub fn prepare(config: &Value, home: &Path) -> Result<String, String> {
     let skills = home.join("skills");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&skills)
         .map_err(|_| "cannot create skills directory".to_string())?;
-    let _ = std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o700));
+    }
 
     // Desired links keyed by hex sha256 of the path string (Python parity).
     let mut desired: std::collections::BTreeMap<String, PathBuf> = Default::default();
@@ -67,7 +85,17 @@ pub fn prepare(config: &Value, home: &Path) -> Result<String, String> {
         if link.exists() {
             return Err("Shared skill path collision; refusing to overwrite".to_string());
         }
+        #[cfg(unix)]
         std::os::unix::fs::symlink(path, &link).map_err(|_| "cannot link skill".to_string())?;
+        #[cfg(windows)]
+        {
+            let linked = if path.is_dir() {
+                std::os::windows::fs::symlink_dir(path, &link)
+            } else {
+                std::os::windows::fs::symlink_file(path, &link)
+            };
+            linked.map_err(|_| "cannot link skill".to_string())?;
+        }
     }
 
     // Context: capped total, UTF-8 required, AGENTS.md + marker file.
@@ -125,12 +153,24 @@ pub fn prepare(config: &Value, home: &Path) -> Result<String, String> {
             if args[0].is_empty() {
                 return Err("Shared plugin executable is empty".to_string());
             }
-            let launcher = home.join(format!("shared-plugin-{index}"));
-            let script = format!("#!/bin/sh\nexec {}\n", shell_join(&args));
+            #[cfg(unix)]
+            let (launcher, script) = (
+                home.join(format!("shared-plugin-{index}")),
+                format!("#!/bin/sh\nexec {}\n", shell_join(&args)),
+            );
+            #[cfg(windows)]
+            let (launcher, script) = (
+                home.join(format!("shared-plugin-{index}.cmd")),
+                format!("@echo off\r\n{}\r\n", cmd_join(&args)),
+            );
             std::fs::write(&launcher, script)
                 .map_err(|_| "cannot write shared plugin".to_string())?;
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| "cannot protect shared plugin".to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "cannot protect shared plugin".to_string())?;
+            }
             profile += &format!(
                 "  - sidecar: {}\n",
                 serde_json::to_string(&launcher.to_string_lossy()).unwrap_or_default()

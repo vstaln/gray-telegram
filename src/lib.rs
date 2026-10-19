@@ -22,5 +22,5 @@ pub mod telegram_check;
 pub mod text;
 pub mod transport;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod e2e_mock;

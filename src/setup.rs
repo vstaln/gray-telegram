@@ -69,6 +69,7 @@ impl Prompter for Tty {
 /// Echo off for one read. Ctrl-C would otherwise kill setup with the
 /// terminal still silent, so SIGINT restores it first (tcsetattr is
 /// async-signal-safe).
+#[cfg(unix)]
 fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     static SAVED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
     extern "C" fn restore_and_exit(_: libc::c_int) {
@@ -97,6 +98,37 @@ fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Echo off for one read via the console input mode. If setup is Ctrl-C'd
+/// mid-read the console stays silent, but cmd.exe restores its own mode at
+/// the next prompt.
+#[cfg(windows)]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return read();
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return read();
+        }
+        let saved = mode;
+        SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT);
+        let out = read();
+        SetConsoleMode(handle, saved);
+        out
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    read()
+}
+
 /// Resolve the gray binary (`GRAY_BIN` env or `PATH` lookup).
 fn resolve_gray(explicit: &str) -> Option<String> {
     let candidate = explicit.trim();
@@ -112,16 +144,21 @@ fn resolve_gray(explicit: &str) -> Option<String> {
 fn which(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if p.metadata().ok()?.permissions().mode() & 0o111 == 0 {
-                    continue;
+        let mut candidates = vec![dir.join(name)];
+        if cfg!(windows) && !name.ends_with(".exe") {
+            candidates.push(dir.join(format!("{name}.exe")));
+        }
+        for p in candidates {
+            if p.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if p.metadata().ok()?.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
                 }
+                return Some(p.to_string_lossy().into_owned());
             }
-            return Some(p.to_string_lossy().into_owned());
         }
     }
     None

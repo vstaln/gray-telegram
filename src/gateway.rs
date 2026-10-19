@@ -457,16 +457,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     }
     let _remove_pid = RemovePid(pid_path);
 
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(parent.join("gateway.lock"))
-        .map_err(|_| "cannot open gateway lock".to_string())?;
-    use std::os::unix::io::AsRawFd;
-    let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked {
+    let Some(lock_file) = crate::runner::open_lock_file(&parent.join("gateway.lock"))
+        .map_err(|_| "cannot open gateway lock".to_string())?
+    else {
         return Err("Another gateway is running".to_string());
-    }
+    };
     let _lock = lock_file;
 
     let mut config = crate::config::load_config(config_path)?;
