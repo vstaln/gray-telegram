@@ -205,7 +205,6 @@ pub fn token(data: &Value) -> Option<String> {
         })
 }
 
-/// The Telegram default model this config pins, when it pins one.
 pub fn default_model(data: &Value) -> Option<String> {
     data.get("model")
         .and_then(Value::as_str)
@@ -214,8 +213,6 @@ pub fn default_model(data: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The model the terminal Gray runs when Telegram pins nothing: the
-/// `model` key of `$gray_home/config.json`.
 pub fn terminal_model(data: &Value) -> Option<String> {
     let home = data.get("gray_home").and_then(Value::as_str).unwrap_or("");
     if home.is_empty() {
@@ -232,9 +229,6 @@ pub fn terminal_model(data: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The model Telegram runs by default: the pinned `model` key (true) or
-/// whatever the terminal Gray config holds (false). A per-chat override is
-/// kept in the store and outranks both.
 pub fn active_model(data: &Value) -> Option<(String, bool)> {
     if let Some(model) = default_model(data) {
         return Some((model, true));

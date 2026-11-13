@@ -481,9 +481,6 @@ impl Rest {
     }
 }
 
-/// A 400 Telegram raises for a body it cannot parse as HTML (or a caption it
-/// cannot): only these are safe to resend, never a timeout or a 5xx, where
-/// the message may already have landed.
 fn html_refused(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     [
