@@ -866,13 +866,11 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) {
     }
 }
 
-/// A short random id for a scheduled job, and the per-chat key a `/model`
-/// pick lives under: the chat override beats the Telegram default, which
-/// beats the terminal Gray default.
 pub fn model_key(conversation: &str) -> String {
     format!("model:{conversation}")
 }
 
+/// A short random id for a scheduled job.
 pub fn uuid_hex() -> String {
     let mut buf = [0u8; 16];
     crate::durable::fill_entropy(&mut buf);
