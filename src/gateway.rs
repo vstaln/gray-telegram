@@ -63,6 +63,37 @@ fn poll_backoff(attempt: u64) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+async fn send_markdown(
+    rest: &Rest,
+    chat_id: &str,
+    markdown: &str,
+) -> Result<Value, TransportError> {
+    let chunks = crate::render::split_markdown(
+        markdown,
+        crate::transport::MAX_MESSAGE_LEN.saturating_sub(64),
+    );
+    let mut first: Option<Value> = None;
+    for chunk in &chunks {
+        match rest.send_text(chat_id, chunk).await {
+            Ok(value) => {
+                if first.is_none() {
+                    first = Some(value);
+                }
+            }
+            Err(error) => {
+                if first.is_none() {
+                    return Err(error);
+                }
+                eprintln!("[telegram] a later chunk failed in chat {chat_id}: {error}");
+                break;
+            }
+        }
+    }
+    first.ok_or(TransportError::Invalid(
+        "Message must contain 1-4096 characters".to_string(),
+    ))
+}
+
 /// A normalized inbound message: everything the admission path needs.
 struct Inbound {
     update_id: i64,
@@ -601,8 +632,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 rest.send_document(&part.channel, Path::new(path), None)
                     .await
             } else {
-                let text = crate::text::sanitize(&part.content);
-                rest.send_text(&part.channel, &text).await
+                send_markdown(&rest, &part.channel, &part.content).await
             };
             match result {
                 Ok(v) => v
