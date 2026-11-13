@@ -105,6 +105,54 @@ impl Drop for LiveStdin {
     }
 }
 
+fn live_pids() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+struct LivePid {
+    conversation: String,
+    pid: u32,
+}
+
+impl LivePid {
+    fn register(conversation: &str, pid: u32) -> Self {
+        if pid != 0 {
+            if let Ok(mut live) = live_pids().lock() {
+                live.insert(conversation.to_string(), pid);
+            }
+        }
+        Self {
+            conversation: conversation.to_string(),
+            pid,
+        }
+    }
+}
+
+impl Drop for LivePid {
+    fn drop(&mut self) {
+        if let Ok(mut live) = live_pids().lock() {
+            if live.get(&self.conversation) == Some(&self.pid) {
+                live.remove(&self.conversation);
+            }
+        }
+    }
+}
+
+pub fn kill(conversation: &str) -> bool {
+    let pid = live_pids()
+        .lock()
+        .ok()
+        .and_then(|live| live.get(conversation).copied())
+        .filter(|pid| *pid != 0);
+    let Some(pid) = pid else {
+        return false;
+    };
+    kill_process_tree(pid);
+    true
+}
+
 pub fn is_live(conversation: &str) -> bool {
     live_stdins()
         .lock()
@@ -465,10 +513,14 @@ pub async fn run_gray_input(
     cmd.env("GRAY_SHOW_REASONING", "0");
     cmd.env("GRAY_MAX_WALL_SECS", (timeout_secs.max(1)).to_string());
     cmd.env("GRAY_STDIN_STEER", "1");
+    if crate::stream::enabled(config) {
+        cmd.env("GRAY_STREAM_TEXT", "1");
+    }
     let mut child = cmd
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
+    let _live_pid = LivePid::register(conversation, pid);
 
     let stdout = child
         .stdout

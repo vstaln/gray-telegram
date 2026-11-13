@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod attachments;
 pub mod budget;
 pub mod capabilities;
@@ -19,6 +20,7 @@ pub mod service;
 pub mod session;
 pub mod setup;
 pub mod sidecar;
+pub mod stream;
 pub mod telegram_check;
 pub mod text;
 pub mod transport;
