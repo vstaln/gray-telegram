@@ -3,6 +3,8 @@
   "name": "gray-telegram-setup",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "routes": [{ "pattern": "setup.gray.alignment.id", "custom_domain": true }],
   "observability": { "enabled": true },
   "vars": { "MANAGER_USERNAME": "GraySetupBot" },
   "durable_objects": {
