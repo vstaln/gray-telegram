@@ -209,15 +209,10 @@ impl Rest {
         Ok(result.as_array().map(|a| a.to_vec()).unwrap_or_default())
     }
 
-    /// `sendMessage` with HTML parse mode. A body Telegram cannot parse as
-    /// HTML (a stray `<` in model output) retries once as plain text rather
-    /// than failing the delivery.
     pub async fn send_text(&self, chat_id: &str, text: &str) -> Result<Value, TransportError> {
         self.send_message(chat_id, text, Value::Null).await
     }
 
-    /// `sendMessage` carrying an inline keyboard (`reply_markup`). The same
-    /// HTML→plain retry applies: a refused body never strands the buttons.
     pub async fn send_markup(
         &self,
         chat_id: &str,
@@ -248,18 +243,18 @@ impl Rest {
             params["reply_markup"] = markup;
         }
         match self.call("sendMessage", &params).await {
-            Err(TransportError::Http(400, detail))
-                if detail.to_ascii_lowercase().contains("parse") =>
-            {
-                params.as_object_mut().map(|p| p.remove("parse_mode"));
+            Err(TransportError::Http(400, detail)) if html_refused(&detail) => {
+                let plain = crate::render::html_to_text(text);
+                params["text"] = Value::String(plain);
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("parse_mode");
+                }
                 self.call("sendMessage", &params).await
             }
             other => other,
         }
     }
 
-    /// `editMessageText` on a picker message. `markup` replaces the
-    /// keyboard (`{"inline_keyboard":[]}` drops it); `None` leaves it.
     pub async fn edit_message(
         &self,
         chat_id: &str,
@@ -282,18 +277,18 @@ impl Rest {
             params["reply_markup"] = markup.clone();
         }
         match self.call("editMessageText", &params).await {
-            Err(TransportError::Http(400, detail))
-                if detail.to_ascii_lowercase().contains("parse") =>
-            {
-                params.as_object_mut().map(|p| p.remove("parse_mode"));
+            Err(TransportError::Http(400, detail)) if html_refused(&detail) => {
+                let plain = crate::render::html_to_text(text);
+                params["text"] = Value::String(plain);
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("parse_mode");
+                }
                 self.call("editMessageText", &params).await
             }
             other => other,
         }
     }
 
-    /// `answerCallbackQuery` — dismisses the client's loading spinner; the
-    /// optional `text` pops as a toast (`alert` for errors it must see).
     pub async fn answer_callback(
         &self,
         callback_query_id: &str,
@@ -375,7 +370,6 @@ impl Rest {
         Ok(bytes.to_vec())
     }
 
-    /// `sendPhoto` — one image upload with an optional HTML caption.
     pub async fn send_photo(
         &self,
         chat_id: &str,
@@ -386,7 +380,6 @@ impl Rest {
             .await
     }
 
-    /// `sendDocument` — any file upload with an optional HTML caption.
     pub async fn send_document(
         &self,
         chat_id: &str,
@@ -412,16 +405,55 @@ impl Rest {
             .to_string();
         let bytes =
             std::fs::read(path).map_err(|_| TransportError::Invalid("cannot read file".into()))?;
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
+        match self
+            .post_upload(method, field, chat_id, &name, &bytes, caption, true)
+            .await
+        {
+            Err(TransportError::Http(400, detail))
+                if caption.is_some() && html_refused(&detail) =>
+            {
+                let plain = caption.map(crate::render::html_to_text);
+                self.post_upload(
+                    method,
+                    field,
+                    chat_id,
+                    &name,
+                    &bytes,
+                    plain.as_deref(),
+                    false,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_upload(
+        &self,
+        method: &str,
+        field: &str,
+        chat_id: &str,
+        name: &str,
+        bytes: &[u8],
+        caption: Option<&str>,
+        parse: bool,
+    ) -> Result<Value, TransportError> {
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(name.to_string());
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
             .part(field.to_string(), part);
-        if let Some(caption) = caption {
-            if !caption.trim().is_empty() && caption.chars().count() <= MAX_CAPTION_LEN {
-                form = form
-                    .text("caption", caption.to_string())
-                    .text("parse_mode", "HTML".to_string());
+        if parse {
+            if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
+                if caption.chars().count() <= MAX_CAPTION_LEN {
+                    form = form
+                        .text("caption", caption.to_string())
+                        .text("parse_mode", "HTML".to_string());
+                }
             }
+        } else if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
+            let clipped: String = caption.chars().take(MAX_CAPTION_LEN).collect();
+            form = form.text("caption", clipped);
         }
         let resp = self
             .client
@@ -447,6 +479,20 @@ impl Rest {
             .await
             .map(|_| ())
     }
+}
+
+fn html_refused(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "parse entities",
+        "can't parse",
+        "unmatched end tag",
+        "unexpected end tag",
+        "can't find end tag",
+        "unsupported start tag",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
 }
 
 /// Bounds-check text before it leaves the process; counts characters like
