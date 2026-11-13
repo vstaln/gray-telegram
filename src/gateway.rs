@@ -654,14 +654,20 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
     };
 
+    let store_run = store.clone();
     let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
         let conv = conv.to_string();
         let input = input.clone();
+        let store = store_run.clone();
         Box::pin(async move {
-            crate::runner::run_gray_input(&cfg, &pth, &conv, input, crate::runner::default_opts())
-                .await
+            let cfg = crate::config::load_config(&pth).unwrap_or(cfg);
+            let opts = crate::runner::RunOpts {
+                model: store.model_get(&conv).ok().flatten(),
+                ..crate::runner::default_opts()
+            };
+            crate::runner::run_gray_input(&cfg, &pth, &conv, input, opts).await
         })
             as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, RunError>> + Send>>
     };
@@ -792,7 +798,13 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                             let id = update.get("update_id").and_then(Value::as_i64).unwrap_or(0);
                             if let Some(cq) = update.get("callback_query") {
                                 crate::graycmd::callback(
-                                    &config, &store, &rest, cq, &owner_id, &allowed,
+                                    &config,
+                                    config_path,
+                                    &store,
+                                    &rest,
+                                    cq,
+                                    &owner_id,
+                                    &allowed,
                                 )
                                 .await;
                             } else if let Some(m) = inbound(update, &bot_username, &bot_id) {

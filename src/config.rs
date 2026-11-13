@@ -175,6 +175,14 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
             }
         }
     }
+    if let Some(model) = data.get("model") {
+        let ok = model
+            .as_str()
+            .is_some_and(|m| !m.trim().is_empty() && m.chars().count() <= 200);
+        if !ok {
+            return Err("model must be a non-empty model id".to_string());
+        }
+    }
     if let Some(policy) = data.get("budget") {
         let model = policy.get("model").and_then(Value::as_str).unwrap_or("");
         crate::budget::validate(policy, model)?;
@@ -195,6 +203,43 @@ pub fn token(data: &Value) -> Option<String> {
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
         })
+}
+
+/// The Telegram default model this config pins, when it pins one.
+pub fn default_model(data: &Value) -> Option<String> {
+    data.get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+/// The model the terminal Gray runs when Telegram pins nothing: the
+/// `model` key of `$gray_home/config.json`.
+pub fn terminal_model(data: &Value) -> Option<String> {
+    let home = data.get("gray_home").and_then(Value::as_str).unwrap_or("");
+    if home.is_empty() {
+        return None;
+    }
+    let provider: Value = fs::read(Path::new(home).join("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+    provider
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+/// The model Telegram runs by default: the pinned `model` key (true) or
+/// whatever the terminal Gray config holds (false). A per-chat override is
+/// kept in the store and outranks both.
+pub fn active_model(data: &Value) -> Option<(String, bool)> {
+    if let Some(model) = default_model(data) {
+        return Some((model, true));
+    }
+    terminal_model(data).map(|model| (model, false))
 }
 
 /// Load + validate. Any IO/parse failure maps to the setup hint.

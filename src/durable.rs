@@ -717,6 +717,28 @@ impl Store {
         })
     }
 
+    pub fn model_get(&self, conversation: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .meta_get(&model_key(conversation))?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
+    pub fn model_set(&self, conversation: &str, model: &str) -> Result<(), String> {
+        self.meta_set(&model_key(conversation), model.trim())
+    }
+
+    pub fn model_clear(&self, conversation: &str) -> Result<(), String> {
+        with_conn(&self.path, |db| {
+            db.execute(
+                "DELETE FROM meta WHERE key=?1",
+                params![model_key(conversation)],
+            )
+            .map(|_| ())
+            .map_err(|_| "cannot store meta".to_string())
+        })
+    }
+
     /// Upsert a `meta` key (the getUpdates offset lives here).
     pub fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
         with_conn(&self.path, |db| {
@@ -818,7 +840,6 @@ pub fn failure_notice(code: &str, reason: &str) -> String {
     }
 }
 
-
 /// Fill `buf` from `/dev/urandom` where it exists; elsewhere mix pid +
 /// time + RandomState so ids and pairing codes still differ.
 pub(crate) fn fill_entropy(buf: &mut [u8]) {
@@ -845,7 +866,13 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) {
     }
 }
 
-/// A short random id for a scheduled job.
+/// A short random id for a scheduled job, and the per-chat key a `/model`
+/// pick lives under: the chat override beats the Telegram default, which
+/// beats the terminal Gray default.
+pub fn model_key(conversation: &str) -> String {
+    format!("model:{conversation}")
+}
+
 pub fn uuid_hex() -> String {
     let mut buf = [0u8; 16];
     crate::durable::fill_entropy(&mut buf);

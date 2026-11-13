@@ -47,6 +47,16 @@ pub async fn check(config: &Value, rest: &Rest) -> Result<(), String> {
     rest.get_chat(chat_id)
         .await
         .map_err(|_| "home chat is not reachable — has it messaged the bot once?".to_string())?;
+    let active = crate::config::active_model(config)
+        .map(|(model, pinned)| {
+            if pinned {
+                format!("{model} (set for Telegram)")
+            } else {
+                format!("{model} (same as terminal Gray)")
+            }
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    println!("Telegram default model: {active}");
     println!("Bot @{bot}, home chat access and local gray configuration verified.");
     println!("Provider generation and a live message round-trip were not tested.");
     Ok(())
