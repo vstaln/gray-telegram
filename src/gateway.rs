@@ -6,6 +6,7 @@
 
 use crate::durable::{OutboxPart, Store};
 use crate::runner::{RunError, RunInput};
+use crate::stream::{Finish, LiveView, Outcome};
 use crate::transport::{Rest, TransportError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,7 @@ async fn send_markdown(
 /// A normalized inbound message: everything the admission path needs.
 struct Inbound {
     update_id: i64,
+    message_id: i64,
     chat_id: String,
     is_private: bool,
     user_id: String,
@@ -188,6 +190,7 @@ fn inbound(update: &Value, bot_username: &str, bot_id: &str) -> Option<Inbound> 
     }
     Some(Inbound {
         update_id,
+        message_id: msg.get("message_id").and_then(Value::as_i64).unwrap_or(0),
         chat_id,
         is_private,
         user_id,
@@ -220,27 +223,32 @@ pub struct Runtime<R, D> {
     pub config: Value,
     pub config_path: PathBuf,
     pub store: Store,
+    pub live: std::sync::Arc<LiveView>,
     pub deliver: D,
     pub runner: R,
     pub rest: Option<Rest>,
     pub clock: Option<std::sync::Arc<dyn Fn() -> f64 + Send + Sync>>,
-    last_typing: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
     busy_backoff: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
 }
 
 impl<R, D> Runtime<R, D> {
-    pub fn new(config: Value, config_path: PathBuf, store: Store, deliver: D, runner: R) -> Self {
+    pub fn new(
+        config: Value,
+        config_path: PathBuf,
+        store: Store,
+        live: std::sync::Arc<LiveView>,
+        deliver: D,
+        runner: R,
+    ) -> Self {
         Self {
             config,
             config_path,
             store,
+            live,
             deliver,
             runner,
             rest: None,
             clock: None,
-            last_typing: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
             busy_backoff: Default::default(),
         }
     }
@@ -262,29 +270,8 @@ impl<R, D> Runtime<R, D> {
             .unwrap_or_else(crate::durable::now_secs)
     }
 
-    /// The Telegram typing indicator, on by default. sendChatAction lasts
-    /// ~5s; the claim path re-pokes it at most every 4s while a turn runs.
-    pub fn typing_enabled(&self) -> bool {
-        self.config
-            .get("typing_indicator")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-    }
-
     pub async fn report_progress(&self, channel: &str) {
-        if !self.typing_enabled() {
-            return;
-        }
-        let now = self.now_secs();
-        let mut map = self.last_typing.lock().await;
-        let last = map.get(channel).copied().unwrap_or(-10.0);
-        if now - last >= 4.0 {
-            map.insert(channel.to_string(), now);
-            drop(map);
-            if let Some(ref rest) = self.rest {
-                let _ = rest.typing(channel).await;
-            }
-        }
+        self.live.typing(channel).await;
     }
 
     /// Where a relative `MEDIA:` path resolves: the configured workdir.
@@ -317,6 +304,7 @@ impl<R, D> Runtime<R, D> {
     async fn deliver_media(&self, channel: &str, media: &[PathBuf]) {
         let Some(ref rest) = self.rest else { return };
         for upload in crate::media_tags::load(media) {
+            self.live.hold(channel).await;
             let send = if upload.is_photo() {
                 rest.send_photo(channel, &upload.path, None).await
             } else {
@@ -360,6 +348,12 @@ impl<R, D> Runtime<R, D> {
             Some(it) => it,
             None => return Ok(false),
         };
+        self.live.begin(&item.conversation);
+        let _driver = crate::stream::drive(
+            self.live.clone(),
+            item.channel.clone(),
+            item.conversation.clone(),
+        );
         self.report_progress(&item.channel).await;
 
         let run_fut = Box::pin((self.runner)(
@@ -387,7 +381,18 @@ impl<R, D> Runtime<R, D> {
                 }
             }
         };
+        let stopped = self
+            .store
+            .get(&item.id)
+            .ok()
+            .flatten()
+            .is_some_and(|cur| cur.cancel);
+        let result = if stopped { None } else { result };
         let Some(result) = result else {
+            self.live
+                .finish(&item.channel, &item.conversation, Outcome::Stopped, None)
+                .await;
+            self.live.concluded(&item.conversation, false).await;
             self.store.fail(&item.id, "cancelled", "")?;
             return Ok(true);
         };
@@ -396,15 +401,31 @@ impl<R, D> Runtime<R, D> {
                 let (prose, media) =
                     crate::media_tags::extract(&answer, &self.media_cwd(), &self.media_roots());
                 let receipt = serde_json::json!({});
-                if prose.trim().is_empty() {
-                    self.store
-                        .complete(&item.id, "(no text answer)", &receipt)?;
+                let text = if prose.trim().is_empty() {
+                    "(no text answer)".to_string()
                 } else {
-                    self.store.complete(&item.id, &prose, &receipt)?;
+                    prose
+                };
+                let settled = self
+                    .live
+                    .finish(
+                        &item.channel,
+                        &item.conversation,
+                        Outcome::Done,
+                        Some(&text),
+                    )
+                    .await;
+                match settled {
+                    Finish::Landed => self.store.complete_landed(&item.id, &receipt)?,
+                    Finish::Durable => self.store.complete(&item.id, &text, &receipt)?,
                 }
+                self.live.concluded(&item.conversation, true).await;
                 self.deliver_media(&item.channel, &media).await;
             }
             Err(RunError::Busy) => {
+                self.live
+                    .finish(&item.channel, &item.conversation, Outcome::Retried, None)
+                    .await;
                 self.store.requeue(&item.id)?;
                 let until = self.now_secs() + BUSY_BACKOFF_SECS;
                 self.busy_backoff
@@ -412,14 +433,23 @@ impl<R, D> Runtime<R, D> {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(item.conversation.clone(), until);
             }
-            Err(RunError::Budget(e)) => {
-                self.store
-                    .fail(&item.id, "budget_blocked", &e.to_string())?
+            Err(e) => {
+                let code = match &e {
+                    RunError::Budget(_) => "budget_blocked",
+                    RunError::Timeout(_) => "timeout",
+                    _ => "agent_failed",
+                };
+                self.live
+                    .finish(
+                        &item.channel,
+                        &item.conversation,
+                        Outcome::Failed(e.to_string()),
+                        None,
+                    )
+                    .await;
+                self.live.concluded(&item.conversation, false).await;
+                self.store.fail(&item.id, code, &e.to_string())?;
             }
-            Err(e @ RunError::Timeout(_)) => {
-                self.store.fail(&item.id, "timeout", &e.to_string())?
-            }
-            Err(e) => self.store.fail(&item.id, "agent_failed", &e.to_string())?,
         }
         Ok(true)
     }
@@ -623,10 +653,14 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         }
     }
 
+    let live = LiveView::new(config.clone(), Some(rest.clone()));
     let rest_del = rest.clone();
+    let live_del = live.clone();
     let deliver = move |part: OutboxPart| {
         let rest = rest_del.clone();
+        let live = live_del.clone();
         Box::pin(async move {
+            live.hold(&part.channel).await;
             let result = if let Some(path) = part.content.strip_prefix(crate::graycmd::FILE_PREFIX)
             {
                 rest.send_document(&part.channel, Path::new(path), None)
@@ -655,16 +689,19 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     };
 
     let store_run = store.clone();
+    let live_run = live.clone();
     let runner = move |cfg: &Value, pth: &Path, conv: &str, input: &RunInput| {
         let cfg = cfg.clone();
         let pth = pth.to_path_buf();
         let conv = conv.to_string();
         let input = input.clone();
         let store = store_run.clone();
+        let live = live_run.clone();
         Box::pin(async move {
             let cfg = crate::config::load_config(&pth).unwrap_or(cfg);
             let opts = crate::runner::RunOpts {
                 model: store.model_get(&conv).ok().flatten(),
+                progress: Some(crate::stream::callback_for(live, conv.clone())),
                 ..crate::runner::default_opts()
             };
             crate::runner::run_gray_input(&cfg, &pth, &conv, input, opts).await
@@ -677,6 +714,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
             config.clone(),
             config_path.to_path_buf(),
             store.clone(),
+            live.clone(),
             deliver,
             runner,
         )
@@ -797,16 +835,30 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                         for update in &updates {
                             let id = update.get("update_id").and_then(Value::as_i64).unwrap_or(0);
                             if let Some(cq) = update.get("callback_query") {
-                                crate::graycmd::callback(
-                                    &config,
-                                    config_path,
-                                    &store,
-                                    &rest,
-                                    cq,
-                                    &owner_id,
-                                    &allowed,
-                                )
-                                .await;
+                                if cq.get("data").and_then(Value::as_str)
+                                    == Some(crate::stream::STOP_CALLBACK)
+                                {
+                                    stop_callback(
+                                        &store,
+                                        &rest,
+                                        &live,
+                                        cq,
+                                        &owner_id,
+                                        &allowed,
+                                    )
+                                    .await;
+                                } else {
+                                    crate::graycmd::callback(
+                                        &config,
+                                        config_path,
+                                        &store,
+                                        &rest,
+                                        cq,
+                                        &owner_id,
+                                        &allowed,
+                                    )
+                                    .await;
+                                }
                             } else if let Some(m) = inbound(update, &bot_username, &bot_id) {
                                 handle_inbound(
                                     &m,
@@ -814,6 +866,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     config_path,
                                     &store,
                                     &rest,
+                                    &live,
                                     &limiter,
                                     &owner_id,
                                     &allowed,
@@ -868,6 +921,57 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn stop_turn(store: &Store, conversation: &str) -> bool {
+    let flagged = store.cancel_conversation(conversation).unwrap_or(false);
+    let killed = crate::runner::kill(conversation);
+    flagged || killed
+}
+
+async fn stop_callback(
+    store: &Store,
+    rest: &Rest,
+    live: &LiveView,
+    cq: &Value,
+    owner_id: &str,
+    allowed: &[String],
+) {
+    let cb_id = cq.get("id").and_then(Value::as_str).unwrap_or("");
+    let from_id = cq
+        .pointer("/from/id")
+        .and_then(Value::as_i64)
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    if !crate::policy::is_allowed_user(&from_id, owner_id, allowed) {
+        let _ = rest
+            .answer_callback(cb_id, Some("Only the owner can stop this."), true)
+            .await;
+        return;
+    }
+    let message = cq.get("message");
+    let chat_id = message
+        .and_then(|m| m.pointer("/chat/id"))
+        .and_then(Value::as_i64)
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let message_id = message
+        .and_then(|m| m.get("message_id"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let Some(conversation) = live.take_stop(&chat_id, message_id) else {
+        let _ = rest
+            .answer_callback(cb_id, Some("That turn already finished."), false)
+            .await;
+        return;
+    };
+    let stopped = stop_turn(store, &conversation);
+    let toast = if stopped {
+        "Stopped."
+    } else {
+        "Nothing running."
+    };
+    let _ = rest.answer_callback(cb_id, Some(toast), false).await;
+}
+
 /// Admit and enqueue (or pair/deflect) one inbound message.
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound(
@@ -876,6 +980,7 @@ async fn handle_inbound(
     config_path: &Path,
     store: &Store,
     rest: &Rest,
+    live: &LiveView,
     limiter: &std::sync::Mutex<crate::ratelimit::RateLimiter>,
     owner_id: &str,
     allowed: &[String],
@@ -937,7 +1042,7 @@ async fn handle_inbound(
                 if !admitted {
                     return send_if_stranger(store, rest, m).await;
                 }
-                let stopped = store.cancel_conversation(&conversation).unwrap_or(false);
+                let stopped = stop_turn(store, &conversation);
                 let text = if stopped {
                     "Stopped the running task."
                 } else {
@@ -1092,7 +1197,11 @@ async fn handle_inbound(
         return;
     }
     let id = format!("tg:{}", m.update_id);
-    match store.enqueue(&id, &m.chat_id, &prompt, Some(&conversation), capacity) {
+    let queued = store.enqueue(&id, &m.chat_id, &prompt, Some(&conversation), capacity);
+    if matches!(queued, Ok(true)) {
+        live.received(&m.chat_id, m.message_id, &conversation).await;
+    }
+    match queued {
         Ok(true) => {
             if let Some(notice) = queued_notice(store, &conversation, &id) {
                 let _ = rest.send_text(&m.chat_id, &notice).await;

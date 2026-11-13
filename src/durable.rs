@@ -409,6 +409,23 @@ impl Store {
         })
     }
 
+    pub fn complete_landed(&self, id: &str, receipt: &Value) -> Result<(), String> {
+        let receipt_text =
+            serde_json::to_string(receipt).map_err(|_| "cannot encode receipt".to_string())?;
+        with_conn(&self.path, |db| {
+            let n = db
+                .execute(
+                    "UPDATE inbox SET state='sent',receipt=?1 WHERE id=?2 AND state='running'",
+                    params![receipt_text, id],
+                )
+                .map_err(|_| "cannot complete".to_string())?;
+            if n == 0 {
+                return Err("Item is not running".to_string());
+            }
+            Ok(())
+        })
+    }
+
     pub fn fail(&self, id: &str, code: &str, reason: &str) -> Result<(), String> {
         let code = match code {
             "interrupted" | "cancelled" | "timeout" | "agent_failed" | "budget_blocked" => code,

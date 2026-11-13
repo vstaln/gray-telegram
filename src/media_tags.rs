@@ -96,6 +96,37 @@ fn tidy(text: &str) -> String {
     out.trim_end().to_string()
 }
 
+pub fn strip_for_display(text: &str) -> String {
+    if !text.contains("MEDIA:") {
+        return text.to_string();
+    }
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        if !line.contains("MEDIA:") {
+            lines.push(line.to_string());
+            continue;
+        }
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(at) = rest.find("MEDIA:") {
+            out.push_str(rest[..at].trim_end_matches(['*', '_', '`']));
+            let body = rest[at + "MEDIA:".len()..].trim_start_matches([' ', '\t']);
+            let end = body
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(body.len());
+            rest = body[end..].trim_start_matches(['*', '_', '`']);
+            if out.ends_with(' ') {
+                rest = rest.trim_start_matches(' ');
+            }
+        }
+        out.push_str(rest);
+        if !out.trim().is_empty() {
+            lines.push(out.trim_end().to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 pub fn resolve(raw: &str, cwd: &Path) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;

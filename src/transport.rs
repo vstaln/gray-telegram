@@ -289,6 +289,66 @@ impl Rest {
         }
     }
 
+    pub async fn delete_message(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+    ) -> Result<(), TransportError> {
+        self.call(
+            "deleteMessage",
+            &json!({"chat_id": chat_id, "message_id": message_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn set_reaction(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        emoji: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let reaction = match emoji {
+            Some(emoji) => json!([{"type": "emoji", "emoji": emoji}]),
+            None => json!([]),
+        };
+        self.call(
+            "setMessageReaction",
+            &json!({"chat_id": chat_id, "message_id": message_id, "reaction": reaction}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn send_draft(
+        &self,
+        chat_id: &str,
+        draft_id: i64,
+        text: &str,
+    ) -> Result<(), TransportError> {
+        check_bounds(
+            text,
+            MAX_MESSAGE_LEN,
+            "Draft must contain 1-4096 characters",
+        )?;
+        let mut params = json!({
+            "chat_id": chat_id,
+            "draft_id": draft_id,
+            "text": text,
+            "parse_mode": "HTML",
+        });
+        match self.call("sendMessageDraft", &params).await {
+            Err(TransportError::Http(400, detail)) if html_refused(&detail) => {
+                params["text"] = Value::String(crate::render::html_to_text(text));
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("parse_mode");
+                }
+                self.call("sendMessageDraft", &params).await.map(|_| ())
+            }
+            other => other.map(|_| ()),
+        }
+    }
+
     pub async fn answer_callback(
         &self,
         callback_query_id: &str,
