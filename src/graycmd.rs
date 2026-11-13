@@ -494,14 +494,10 @@ pub async fn dispatch(
         let _ = builder.create(&home);
     }
 
-    let model_flow = spec.as_ref().map(|spec| spec.name.as_str()).unwrap_or(name) == "model";
-    let mut before: Option<String> = None;
-    if model_flow {
-        if let Some(model) = store.model_get(conversation).ok().flatten() {
-            seed_home_model(&home, &model);
-        }
-        before = home_model(&home);
+    if let Some(model) = store.model_get(conversation).ok().flatten() {
+        seed_home_model(&home, &model);
     }
+    let mut before = home_model(&home);
 
     let mut argv: Vec<&str> = vec!["run", name];
     if !args.trim().is_empty() {
@@ -536,12 +532,9 @@ pub async fn dispatch(
             let _ = rest.send_text(chat_id, &text).await;
         }
         Ok(Reply::Result(result)) => {
-            if model_flow {
-                if let Some(model) =
-                    sync_chat_model(config, store, conversation, &home, before.take())
-                {
-                    announce_chat_model(rest, chat_id, &model).await;
-                }
+            if let Some(model) = sync_chat_model(config, store, conversation, &home, before.take())
+            {
+                announce_chat_model(rest, chat_id, &model).await;
             }
             match result.get("kind").and_then(Value::as_str) {
                 Some("prompt") => {
@@ -746,14 +739,10 @@ pub async fn callback(
     // The home comes from the stored row — the same scope `run` used.
     let is_private = msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
     let conversation = crate::session::conversation_key(&chat_id, &from_id, is_private);
-    let model_flow = row.name == "model";
-    let mut before: Option<String> = None;
-    if model_flow {
-        if let Some(model) = store.model_get(&conversation).ok().flatten() {
-            seed_home_model(Path::new(&row.home), &model);
-        }
-        before = home_model(Path::new(&row.home));
+    if let Some(model) = store.model_get(&conversation).ok().flatten() {
+        seed_home_model(Path::new(&row.home), &model);
     }
+    let mut before = home_model(Path::new(&row.home));
     let action_json = serde_json::to_string(&action).unwrap_or_default();
     let reply = match cmd_json(&bin, Path::new(&row.home), &["interact", tok, &action_json]).await {
         Ok(v) => v,
@@ -784,16 +773,14 @@ pub async fn callback(
             }
         },
         Ok(Reply::Result(result)) => {
-            if model_flow {
-                if let Some(model) = sync_chat_model(
-                    config,
-                    store,
-                    &conversation,
-                    Path::new(&row.home),
-                    before.take(),
-                ) {
-                    announce_chat_model(rest, &chat_id, &model).await;
-                }
+            if let Some(model) = sync_chat_model(
+                config,
+                store,
+                &conversation,
+                Path::new(&row.home),
+                before.take(),
+            ) {
+                announce_chat_model(rest, &chat_id, &model).await;
             }
             match result.get("kind").and_then(Value::as_str) {
                 Some("prompt") => {
