@@ -13,6 +13,7 @@ pub mod media_tags;
 pub mod pairing;
 pub mod policy;
 pub mod ratelimit;
+pub mod render;
 pub mod runner;
 pub mod service;
 pub mod session;

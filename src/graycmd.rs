@@ -303,37 +303,14 @@ async fn send_result_text(
     home: &Path,
     text: &str,
 ) {
-    let limit = crate::transport::MAX_MESSAGE_LEN - 48;
-    if text.trim().is_empty() {
+    let limit = crate::transport::MAX_MESSAGE_LEN - 64;
+    let pages = crate::render::split_markdown(text, limit);
+    if pages.is_empty() {
         let _ = rest.send_text(chat_id, "Done.").await;
         return;
     }
-    let body = md_to_html(&crate::text::sanitize(text));
-    if crate::text::utf16_len(&body) <= limit {
-        if let Err(e) = rest.send_text(chat_id, &body).await {
-            eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
-        }
-        return;
-    }
-    let mut budget = limit - 24;
-    let pages: Vec<String> = loop {
-        let rendered: Vec<String> = crate::text::paginate_markdown(text, budget)
-            .into_iter()
-            .map(|page| md_to_html(&crate::text::sanitize(&page)))
-            .collect();
-        if rendered.iter().all(|p| crate::text::utf16_len(p) <= limit) {
-            break rendered;
-        }
-        if budget <= 128 {
-            break rendered
-                .into_iter()
-                .flat_map(|p| crate::text::split_message(&p, limit).unwrap_or_else(|_| vec![p]))
-                .collect();
-        }
-        budget /= 2;
-    };
-    if pages.len() <= 1 {
-        if let Err(e) = rest.send_text(chat_id, &body).await {
+    if pages.len() == 1 {
+        if let Err(e) = rest.send_text(chat_id, &pages[0]).await {
             eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
         }
         return;
@@ -396,9 +373,9 @@ async fn send_ui(
         crate::durable::now_secs(),
     );
     let text = if body.trim().is_empty() {
-        md_to_html(fallback)
+        crate::render::markdown_to_html(fallback)
     } else {
-        md_to_html(&crate::text::sanitize(&body))
+        crate::render::markdown_to_html(&body)
     };
     let send = rest.send_markup(chat_id, &text, &markup).await;
     if let Err(e) = send {
@@ -726,9 +703,9 @@ pub async fn callback(
                 match compile(&document, next_tok) {
                     Some((body, markup)) => {
                         let text = if body.trim().is_empty() {
-                            md_to_html(fallback)
+                            crate::render::markdown_to_html(fallback)
                         } else {
-                            md_to_html(&crate::text::sanitize(&body))
+                            crate::render::markdown_to_html(&body)
                         };
                         let doc_json = serde_json::to_string(&document).unwrap_or_default();
                         let _ = store.cmd_doc_put(
@@ -748,7 +725,7 @@ pub async fn callback(
                             .edit_message(
                                 &chat_id,
                                 message_id,
-                                &md_to_html(fallback),
+                                &crate::render::markdown_to_html(fallback),
                                 Some(&empty_kb),
                             )
                             .await;
@@ -764,7 +741,7 @@ pub async fn callback(
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or("Done.");
-                let body = md_to_html(&crate::text::sanitize(text));
+                let body = crate::render::markdown_to_html(text);
                 let _ = rest
                     .edit_message(&chat_id, message_id, &body, Some(&empty_kb))
                     .await;
@@ -1000,142 +977,6 @@ pub async fn register_commands(rest: &crate::transport::Rest, registry: &Registr
     }
 }
 
-/// `gray cmd` answers markdown; sendMessage speaks HTML. This is the small
-/// common-denominator translation — fences, code spans, bold, italic,
-/// links — not a CommonMark renderer; transport's plain-text retry is the
-/// net for anything outside it.
-pub fn md_to_html(md: &str) -> String {
-    let mut out = String::new();
-    let mut rest = md;
-    while let Some(start) = rest.find("```") {
-        out.push_str(&inline(&crate::text::escape_html(&rest[..start])));
-        let after = &rest[start + 3..];
-        // An optional language tag rides the opening fence line.
-        let after = after.split_once('\n').map(|(_, r)| r).unwrap_or(after);
-        match after.find("```") {
-            Some(end) => {
-                out.push_str("<pre>");
-                out.push_str(&crate::text::escape_html(&after[..end]));
-                out.push_str("</pre>");
-                rest = &after[end + 3..];
-            }
-            None => {
-                out.push_str("<pre>");
-                out.push_str(&crate::text::escape_html(after));
-                out.push_str("</pre>");
-                rest = "";
-            }
-        }
-    }
-    out.push_str(&inline(&crate::text::escape_html(rest)));
-    out
-}
-
-/// Inline markup on already-escaped text. Code spans are extracted to
-/// placeholders first so `*` inside `` `code` `` stays literal.
-fn inline(escaped: &str) -> String {
-    let (s, codes) = extract_code(escaped);
-    let s = delim(&s, "**", "<b>", "</b>", false);
-    let s = delim(&s, "__", "<b>", "</b>", true);
-    let s = delim(&s, "*", "<i>", "</i>", false);
-    let s = delim(&s, "_", "<i>", "</i>", true);
-    let s = links(&s);
-    let mut out = s;
-    for (i, code) in codes.iter().enumerate() {
-        out = out.replace(&format!("\u{1}{i}\u{1}"), &format!("<code>{code}</code>"));
-    }
-    out
-}
-
-/// Pair `open`/`close` around `d`-delimited runs; an odd trailing mark stays
-/// literal and never leaves a dangling tag. `wordy` delimiters (`_`) ignore
-/// marks with alphanumerics on both sides so `snake_case` names survive.
-fn delim(s: &str, d: &str, open: &str, close: &str, wordy: bool) -> String {
-    let active = |at: usize| -> bool {
-        if !wordy {
-            return true;
-        }
-        let word = |c: Option<char>| c.map(|c| c.is_alphanumeric()).unwrap_or(false);
-        !(word(s[..at].chars().last()) && word(s[at + d.len()..].chars().next()))
-    };
-    let mut marks: Vec<usize> = Vec::new();
-    let mut scan = 0;
-    while let Some(i) = s[scan..].find(d) {
-        let at = scan + i;
-        if active(at) {
-            marks.push(at);
-        }
-        scan = at + d.len();
-    }
-    let pairs = marks.len() / 2 * 2;
-    let mut out = String::new();
-    let mut cursor = 0;
-    for (n, at) in marks.iter().enumerate() {
-        out.push_str(&s[cursor..*at]);
-        out.push_str(if n < pairs {
-            if n % 2 == 0 {
-                open
-            } else {
-                close
-            }
-        } else {
-            d
-        });
-        cursor = at + d.len();
-    }
-    out.push_str(&s[cursor..]);
-    out
-}
-
-/// `` `x` `` → placeholder slots; restored after the other delimiters run.
-fn extract_code(escaped: &str) -> (String, Vec<String>) {
-    let mut codes = Vec::new();
-    let mut out = String::new();
-    let mut rest = escaped;
-    while let Some(i) = rest.find('`') {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i + 1..];
-        match tail.find('`') {
-            Some(j) => {
-                codes.push(tail[..j].to_string());
-                out.push_str(&format!("\u{1}{}\u{1}", codes.len() - 1));
-                rest = &tail[j + 1..];
-            }
-            None => {
-                out.push('`');
-                rest = tail;
-            }
-        }
-    }
-    out.push_str(rest);
-    (out, codes)
-}
-
-/// `[label](url)` → `<a href>`. Anything half-formed stays literal.
-fn links(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find("](") {
-        let Some(j) = rest[..i].rfind('[') else {
-            out.push_str(&rest[..i + 2]);
-            rest = &rest[i + 2..];
-            continue;
-        };
-        let Some(k) = rest[i + 2..].find(')') else {
-            break;
-        };
-        out.push_str(&rest[..j]);
-        out.push_str(&format!(
-            "<a href=\"{}\">{}</a>",
-            &rest[i + 2..i + 2 + k],
-            &rest[j + 1..i]
-        ));
-        rest = &rest[i + 2 + k + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,22 +1075,6 @@ mod tests {
         let doc = model_picker();
         let long_tok = "t".repeat(60);
         assert!(compile(&doc, &long_tok).is_none());
-    }
-
-    #[test]
-    fn markdown_renders_html() {
-        assert_eq!(
-            md_to_html("**Model** — `gpt-5` · effort `m`"),
-            "<b>Model</b> — <code>gpt-5</code> · effort <code>m</code>"
-        );
-        assert_eq!(md_to_html("a_b_c"), "a_b_c");
-        assert_eq!(md_to_html("_x_"), "<i>x</i>");
-        assert_eq!(
-            md_to_html("see [docs](https://x.dev/y)"),
-            "see <a href=\"https://x.dev/y\">docs</a>"
-        );
-        assert_eq!(md_to_html("a < b"), "a &lt; b");
-        assert_eq!(md_to_html("```\nx<y\n```"), "<pre>x&lt;y\n</pre>");
     }
 
     #[test]
