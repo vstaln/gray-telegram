@@ -479,6 +479,9 @@ pub async fn run_with(
         }
     };
 
+    let model = io.prompt("Model for Telegram (Enter to use the same model as terminal Gray): ")?;
+    let model = model.trim().to_string();
+
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let workdir = parent.join("work").to_string_lossy().into_owned();
 
@@ -500,6 +503,9 @@ pub async fn run_with(
     });
     if !owner_id.is_empty() {
         config["owner_id"] = Value::String(owner_id);
+    }
+    if !model.is_empty() {
+        config["model"] = Value::String(model);
     }
     crate::config::save_config(config_path, &config)?;
     io.print_line(&format!("Config written to {}", config_path.display()));
