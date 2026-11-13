@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gray-telegram-setup",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+  "vars": { "MANAGER_USERNAME": "GraySetupBot" },
+  "durable_objects": {
+    "bindings": [{ "name": "SETUP", "class_name": "SetupStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SetupStore"] }]
+}
