@@ -32,11 +32,12 @@ pub enum Command {
         /// Discover the owner's IDs by DMing a one-time code to the bot.
         #[arg(long)]
         pair: bool,
-        /// Create a new bot in Telegram through the Gray Setup service.
-        #[arg(long, conflicts_with_all = ["pair", "token_stdin"])]
+        #[arg(long, conflicts_with_all = ["pair", "token_stdin"], help = "Create a new bot in Telegram through the Gray Setup service.")]
         create: bool,
-        /// Read the BotFather token from stdin instead of prompting.
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Read the BotFather token from stdin instead of prompting."
+        )]
         token_stdin: bool,
     },
     Run,
