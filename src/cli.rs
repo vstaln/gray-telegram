@@ -32,6 +32,12 @@ pub enum Command {
         /// Discover the owner's IDs by DMing a one-time code to the bot.
         #[arg(long)]
         pair: bool,
+        /// Create a new bot in Telegram through the Gray Setup service.
+        #[arg(long, conflicts_with_all = ["pair", "token_stdin"])]
+        create: bool,
+        /// Read the BotFather token from stdin instead of prompting.
+        #[arg(long)]
+        token_stdin: bool,
     },
     Run,
     Sidecar,
@@ -245,8 +251,12 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
             let config: Value = crate::config::load_config(config_path)?;
             register(&config, config_path)
         }
-        Command::Setup { pair } => {
-            use crate::setup::Prompter;
+        Command::Setup {
+            pair,
+            create,
+            token_stdin,
+        } => {
+            use crate::setup::{OwnerSource, Prompter, SetupPath};
             let mut io = crate::setup::Tty;
             // setup is async; drive it on a throwaway current-thread runtime
             // so `run` stays sync like the other CLI arms.
@@ -254,7 +264,19 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|_| "cannot start setup runtime".to_string())?;
-            let done = rt.block_on(crate::setup::run(config_path, &mut io, *pair))?;
+            let owner = if *pair {
+                OwnerSource::PairingCode
+            } else {
+                OwnerSource::UserIds
+            };
+            let path = if *create {
+                SetupPath::Create
+            } else if *token_stdin {
+                SetupPath::TokenStdin(owner)
+            } else {
+                SetupPath::Ask(owner)
+            };
+            let done = rt.block_on(crate::setup::run(config_path, &mut io, path))?;
             if done {
                 let config: Value = crate::config::load_config(config_path)?;
                 register(&config, config_path)?;
@@ -262,23 +284,30 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 if crate::service::installed(config_path) {
                     // A reconfigured bot takes effect now.
                     println!("{}", crate::service::restart(config_path)?);
-                    return Ok(());
-                }
-                let answer = io.prompt("Enable and start the background service now? [Y/n] ")?;
-                if install_confirmed(&answer) {
-                    let line = crate::service::install(config_path)?;
-                    println!("{line}");
-                    println!("Run gray telegram status to check it.");
-                    if matches!(
-                        crate::service::detect(),
-                        crate::service::Supervisor::SystemdUser { .. }
-                    ) {
-                        println!("For operation after logout: loginctl enable-linger \"$USER\"");
-                    }
                 } else {
-                    println!(
-                        "Run gray telegram install when ready, or gray telegram run in the foreground."
-                    );
+                    let answer =
+                        io.prompt("Enable and start the background service now? [Y/n] ")?;
+                    if install_confirmed(&answer) {
+                        let line = crate::service::install(config_path)?;
+                        println!("{line}");
+                        println!("Run gray telegram status to check it.");
+                        if matches!(
+                            crate::service::detect(),
+                            crate::service::Supervisor::SystemdUser { .. }
+                        ) {
+                            println!(
+                                "For operation after logout: loginctl enable-linger \"$USER\""
+                            );
+                        }
+                    } else {
+                        println!(
+                            "Run gray telegram install when ready, or gray telegram run in the foreground."
+                        );
+                    }
+                }
+                match rt.block_on(crate::setup::send_hello(&config)) {
+                    Ok(()) => println!("Sent the new bot a hello message."),
+                    Err(e) => println!("Could not send the hello message: {e}"),
                 }
             }
             Ok(())
