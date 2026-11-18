@@ -211,8 +211,168 @@ fn escape_attr(text: &str) -> String {
     crate::text::escape_html(text).replace('"', "&quot;")
 }
 
+pub fn needs_rich_message(md: &str) -> bool {
+    let mut in_fence = false;
+    for line in md.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if (t.starts_with('|') && t.ends_with('|') && t.len() >= 3)
+            || t.starts_with("- [ ] ")
+            || t.starts_with("- [x] ")
+            || t.starts_with("- [X] ")
+            || t.contains("<details>")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn normalize_latex(md: &str) -> String {
+    if !md.contains('\\') {
+        return md.to_string();
+    }
+    let mut out = String::with_capacity(md.len());
+    let bytes = md.as_bytes();
+    let mut i = 0;
+    let mut in_fence = false;
+    let mut in_inline = false;
+    while i < bytes.len() {
+        if !in_inline
+            && (i == 0 || bytes[i - 1] == b'\n')
+            && (md[i..].starts_with("```") || md[i..].starts_with("~~~"))
+        {
+            in_fence = !in_fence;
+            let end = md[i..].find('\n').map(|n| i + n + 1).unwrap_or(bytes.len());
+            out.push_str(&md[i..end]);
+            i = end;
+            continue;
+        }
+        if !in_fence && bytes[i] == b'`' {
+            in_inline = !in_inline;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        if in_fence || in_inline {
+            let ch = md[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            if let Some((rep, adv)) = replace_latex_macro(&md[i..]) {
+                out.push_str(&rep);
+                i += adv;
+                continue;
+            }
+        }
+        let ch = md[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn replace_latex_macro(s: &str) -> Option<(String, usize)> {
+    const MACROS: &[(&str, &str)] = &[
+        ("\\rightarrow", "→"),
+        ("\\leftarrow", "←"),
+        ("\\Rightarrow", "⇒"),
+        ("\\leftrightarrow", "↔"),
+        ("\\approx", "≈"),
+        ("\\times", "×"),
+        ("\\cdot", "·"),
+        ("\\pm", "±"),
+        ("\\le", "≤"),
+        ("\\ge", "≥"),
+        ("\\ne", "≠"),
+        ("\\neq", "≠"),
+        ("\\to", "→"),
+        ("\\infty", "∞"),
+        ("\\sum", "∑"),
+        ("\\prod", "∏"),
+        ("\\int", "∫"),
+        ("\\partial", "∂"),
+        ("\\nabla", "∇"),
+        ("\\forall", "∀"),
+        ("\\exists", "∃"),
+        ("\\notin", "∉"),
+        ("\\in", "∈"),
+        ("\\subset", "⊂"),
+        ("\\cup", "∪"),
+        ("\\cap", "∩"),
+        ("\\alpha", "α"),
+        ("\\beta", "β"),
+        ("\\gamma", "γ"),
+        ("\\delta", "δ"),
+        ("\\epsilon", "ε"),
+        ("\\theta", "θ"),
+        ("\\lambda", "λ"),
+        ("\\mu", "μ"),
+        ("\\pi", "π"),
+        ("\\sigma", "σ"),
+        ("\\phi", "φ"),
+        ("\\omega", "ω"),
+        ("\\Delta", "Δ"),
+        ("\\Sigma", "Σ"),
+        ("\\Omega", "Ω"),
+    ];
+    if let Some(rest) = s.strip_prefix("\\frac{") {
+        if let Some((num, after_num)) = read_braced(rest) {
+            if let Some(after_open) = after_num.strip_prefix('{') {
+                if let Some((den, after_den)) = read_braced(after_open) {
+                    let consumed = s.len() - after_den.len();
+                    return Some((format!("({num})/({den})"), consumed));
+                }
+            }
+        }
+    }
+    if let Some(rest) = s.strip_prefix("\\sqrt{") {
+        if let Some((inner, after)) = read_braced(rest) {
+            let consumed = s.len() - after.len();
+            return Some((format!("√({inner})"), consumed));
+        }
+    }
+    for (pat, rep) in MACROS {
+        if let Some(after) = s.strip_prefix(pat) {
+            if !after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            {
+                return Some(((*rep).to_string(), pat.len()));
+            }
+        }
+    }
+    None
+}
+
+fn read_braced(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 1usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..idx], &s[idx + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn render(md: &str, face: Face) -> Vec<String> {
-    let cleaned = crate::text::sanitize(md).replace('\r', "");
+    let cleaned = normalize_latex(&crate::text::sanitize(md).replace('\r', ""));
     let mut walker = Walker::new(&cleaned, face);
     walker.blocks(None)
 }

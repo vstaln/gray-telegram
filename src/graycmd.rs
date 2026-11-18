@@ -441,8 +441,24 @@ async fn send_ui(
     } else {
         crate::render::markdown_to_html(&body)
     };
-    let send = rest.send_markup(chat_id, &text, &markup).await;
-    if let Err(e) = send {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match rest.send_markup(chat_id, &text, &markup).await {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) if e.is_retryable() && attempt < 2 => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = last_err {
         eprintln!("[telegram] picker post failed in chat {chat_id}: {e}");
         let _ = store.cmd_doc_delete(token);
     }
@@ -650,6 +666,50 @@ pub async fn callback(
             eprintln!("[telegram] default-model edit failed in chat {chat_id}: {e}");
         }
         toast(Some("Saved as the Telegram default."), false).await;
+        return;
+    }
+
+    if data.starts_with("gs|") {
+        let mut parts = data.split('|');
+        let (Some("gs"), Some(tok), Some(lid), Some(page_str), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            toast(Some("Unknown action."), false).await;
+            return;
+        };
+        if !crate::policy::is_allowed_user(&from_id, owner_id, allowed) {
+            toast(Some("This picker is not for you."), true).await;
+            return;
+        }
+        let row = match store.cmd_doc_get(tok, DOC_TTL_SECS, crate::durable::now_secs()) {
+            Ok(Some(row)) => row,
+            _ => {
+                toast(Some("Picker expired — send the command again."), false).await;
+                return;
+            }
+        };
+        if row.owner != from_id {
+            toast(Some("This picker belongs to someone else."), true).await;
+            return;
+        }
+        let Ok(page) = page_str.parse::<usize>() else {
+            toast(Some("Unknown action."), false).await;
+            return;
+        };
+        let doc: Value = serde_json::from_str(&row.doc).unwrap_or(Value::Null);
+        let mut pages = std::collections::HashMap::new();
+        pages.insert(lid.to_string(), page);
+        if let Some((body, markup)) = compile_with_pages(&doc, tok, &pages) {
+            let text = crate::render::markdown_to_html(&body);
+            let _ = rest
+                .edit_message(&chat_id, message_id, &text, Some(&markup))
+                .await;
+        }
+        toast(None, false).await;
         return;
     }
 
@@ -925,7 +985,22 @@ fn cb_data(tok: &str, lid: &str, arg: &str) -> Option<String> {
 
 /// `gray.ui` v1 → (markdown body, inline_keyboard markup). `None` means the
 /// document cannot render on Telegram — the caller posts `fallback_text`.
+const SELECT_PAGE: usize = 6;
+
+fn select_cb_page(tok: &str, lid: &str, page: usize) -> Option<String> {
+    let data = format!("gs|{tok}|{lid}|{page}");
+    (data.len() <= CALLBACK_MAX).then_some(data)
+}
+
 fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
+    compile_with_pages(document, token, &std::collections::HashMap::new())
+}
+
+fn compile_with_pages(
+    document: &Value,
+    token: &str,
+    pages: &std::collections::HashMap<String, usize>,
+) -> Option<(String, Value)> {
     if token.is_empty() {
         return None;
     }
@@ -957,31 +1032,68 @@ fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
                                 .and_then(Value::as_array)
                                 .cloned()
                                 .unwrap_or_default();
-                            // Telegram pickers are a vertical button list —
-                            // one row per option.
-                            for (i, opt) in options.iter().take(25).enumerate() {
-                                let label = opt
-                                    .get("label")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                if label.is_empty() {
-                                    continue;
-                                }
-                                let label = match opt.get("description").and_then(Value::as_str) {
-                                    Some(d) if !d.is_empty() => {
-                                        truncate(&format!("{label} — {d}"), 80)
+                            let formatted: Vec<(usize, String)> = options
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, opt)| {
+                                    let raw =
+                                        opt.get("label").and_then(Value::as_str).unwrap_or("");
+                                    if raw.is_empty() {
+                                        return None;
                                     }
-                                    _ => truncate(&label, 80),
-                                };
-                                let label =
-                                    if opt.get("default").and_then(Value::as_bool) == Some(true) {
+                                    let label = truncate(raw, 48);
+                                    let label = if opt.get("default").and_then(Value::as_bool)
+                                        == Some(true)
+                                    {
                                         format!("• {label}")
                                     } else {
                                         label
                                     };
-                                let data = cb_data(token, lid, &i.to_string())?;
-                                rows.push(json!([{"text": label, "callback_data": data}]));
+                                    Some((i, label))
+                                })
+                                .collect();
+                            let inline = formatted.len() >= 3
+                                && formatted.len() <= 4
+                                && formatted.iter().all(|(_, l)| l.chars().count() <= 12);
+                            if inline {
+                                let mut row_btns = Vec::with_capacity(formatted.len());
+                                for (i, label) in formatted {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    row_btns.push(json!({"text": label, "callback_data": data}));
+                                }
+                                rows.push(Value::Array(row_btns));
+                            } else if formatted.len() > SELECT_PAGE {
+                                let total = formatted.len().div_ceil(SELECT_PAGE);
+                                let default_page = options
+                                    .iter()
+                                    .position(|o| {
+                                        o.get("default").and_then(Value::as_bool) == Some(true)
+                                    })
+                                    .map(|idx| idx / SELECT_PAGE)
+                                    .unwrap_or(0);
+                                let page = pages
+                                    .get(lid)
+                                    .copied()
+                                    .unwrap_or(default_page)
+                                    .min(total - 1);
+                                let start = page * SELECT_PAGE;
+                                let end = (start + SELECT_PAGE).min(formatted.len());
+                                for (i, label) in &formatted[start..end] {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    rows.push(json!([{"text": label, "callback_data": data}]));
+                                }
+                                let prev = page.saturating_sub(1);
+                                let next = (page + 1).min(total - 1);
+                                rows.push(json!([
+                                    {"text": "◀", "callback_data": select_cb_page(token, lid, prev)?},
+                                    {"text": format!("{}/{}", page + 1, total), "callback_data": select_cb_page(token, lid, page)?},
+                                    {"text": "▶", "callback_data": select_cb_page(token, lid, next)?},
+                                ]));
+                            } else {
+                                for (i, label) in formatted {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    rows.push(json!([{"text": label, "callback_data": data}]));
+                                }
                             }
                         }
                         Some("button") => {
@@ -1095,9 +1207,69 @@ pub fn command_menu(list: Option<&CommandList>) -> Vec<Value> {
 /// (no `cmd`) just leaves the built-in menu.
 pub async fn register_commands(rest: &crate::transport::Rest, registry: &Registry) {
     let list = registry.get().await;
-    if let Err(e) = rest.set_my_commands(&command_menu(list.as_deref())).await {
-        eprintln!("[telegram] setMyCommands failed: {e}");
+    let menu = command_menu(list.as_deref());
+    for scope in [
+        serde_json::json!({"type": "default"}),
+        serde_json::json!({"type": "all_private_chats"}),
+        serde_json::json!({"type": "all_group_chats"}),
+    ] {
+        if let Err(e) = rest.set_my_commands_scoped(&menu, scope).await {
+            eprintln!("[telegram] setMyCommands failed: {e}");
+            break;
+        }
     }
+}
+
+pub async fn register_chat_commands(
+    rest: &crate::transport::Rest,
+    registry: &Registry,
+    chat_id: &str,
+) {
+    let Ok(id) = chat_id.parse::<i64>() else {
+        return;
+    };
+    let list = registry.get().await;
+    let menu = command_menu(list.as_deref());
+    let _ = rest
+        .set_my_commands_scoped(&menu, serde_json::json!({"type": "chat", "chat_id": id}))
+        .await;
+}
+
+pub async fn handle_inline_query(rest: &crate::transport::Rest, registry: &Registry, iq: &Value) {
+    let Some(iq_id) = iq.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let q = iq
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    let list = registry.get().await;
+    let menu = command_menu(list.as_deref());
+    let mut results = Vec::new();
+    for (idx, item) in menu.iter().enumerate() {
+        let cmd = item.get("command").and_then(Value::as_str).unwrap_or("");
+        let desc = item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !q.is_empty() && !cmd.contains(&q) && !desc.to_ascii_lowercase().contains(&q) {
+            continue;
+        }
+        results.push(serde_json::json!({
+            "type": "article",
+            "id": format!("cmd-{idx}"),
+            "title": format!("/{cmd}"),
+            "description": desc,
+            "input_message_content": {"message_text": format!("/{cmd}")},
+        }));
+        if results.len() >= 25 {
+            break;
+        }
+    }
+    let _ = rest.answer_inline_query(iq_id, &results).await;
 }
 
 #[cfg(test)]

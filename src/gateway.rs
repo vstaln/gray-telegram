@@ -64,18 +64,44 @@ fn poll_backoff(attempt: u64) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+fn split_channel(channel: &str) -> (&str, Option<i64>) {
+    match channel.split_once('#') {
+        Some((chat, tid)) => (chat, tid.parse::<i64>().ok()),
+        None => (channel, None),
+    }
+}
+
+fn join_channel(chat_id: &str, thread_id: Option<i64>) -> String {
+    match thread_id {
+        Some(tid) => format!("{chat_id}#{tid}"),
+        None => chat_id.to_string(),
+    }
+}
+
 async fn send_markdown(
     rest: &Rest,
-    chat_id: &str,
+    channel: &str,
     markdown: &str,
 ) -> Result<Value, TransportError> {
+    let (chat_id, thread_id) = split_channel(channel);
+    if crate::render::needs_rich_message(markdown)
+        && rest.rich_supported()
+        && markdown.len() <= crate::transport::MAX_MESSAGE_LEN
+    {
+        if let Ok(v) = rest
+            .send_rich_message_in(chat_id, thread_id, markdown)
+            .await
+        {
+            return Ok(v);
+        }
+    }
     let chunks = crate::render::split_markdown(
         markdown,
         crate::transport::MAX_MESSAGE_LEN.saturating_sub(64),
     );
     let mut first: Option<Value> = None;
     for chunk in &chunks {
-        match rest.send_text(chat_id, chunk).await {
+        match rest.send_text_in(chat_id, thread_id, chunk).await {
             Ok(value) => {
                 if first.is_none() {
                     first = Some(value);
@@ -100,11 +126,13 @@ struct Inbound {
     update_id: i64,
     message_id: i64,
     chat_id: String,
+    thread_id: Option<i64>,
+    is_forum: bool,
+    media_group_id: Option<String>,
     is_private: bool,
     user_id: String,
     is_bot: bool,
     text: String,
-    /// `(file_id, suggested filename)` pairs from photo/document payloads.
     files: Vec<(String, String)>,
     mentioned: bool,
     reply_to_bot: bool,
@@ -153,6 +181,78 @@ fn inbound(update: &Value, bot_username: &str, bot_id: &str) -> Option<Inbound> 
             files.push((id.to_string(), name));
         }
     }
+    if let Some(voice) = msg.get("voice") {
+        if let Some(id) = voice.get("file_id").and_then(Value::as_str) {
+            let dur = voice.get("duration").and_then(Value::as_u64).unwrap_or(0);
+            files.push((id.to_string(), "voice.ogg".to_string()));
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[voice: {dur}s]"));
+        }
+    }
+    if let Some(audio) = msg.get("audio") {
+        if let Some(id) = audio.get("file_id").and_then(Value::as_str) {
+            let dur = audio.get("duration").and_then(Value::as_u64).unwrap_or(0);
+            let name = audio
+                .get("file_name")
+                .and_then(Value::as_str)
+                .unwrap_or("audio.mp3")
+                .to_string();
+            let title = audio.get("title").and_then(Value::as_str).unwrap_or("");
+            let perf = audio.get("performer").and_then(Value::as_str).unwrap_or("");
+            files.push((id.to_string(), name));
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[audio: {perf} - {title} ({dur}s)]"));
+        }
+    }
+    if let Some(sticker) = msg.get("sticker") {
+        let emoji = sticker.get("emoji").and_then(Value::as_str).unwrap_or("");
+        let set_name = sticker
+            .get("set_name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let is_anim = sticker
+            .get("is_animated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let is_vid = sticker
+            .get("is_video")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !is_anim && !is_vid {
+            if let Some(id) = sticker.get("file_id").and_then(Value::as_str) {
+                files.push((id.to_string(), "sticker.webp".to_string()));
+            }
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[sticker: {emoji} ({set_name})]"));
+    }
+    if let Some(dice) = msg.get("dice") {
+        let emoji = dice.get("emoji").and_then(Value::as_str).unwrap_or("🎲");
+        let val = dice.get("value").and_then(Value::as_i64).unwrap_or(0);
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[dice: {emoji} = {val}]"));
+    }
+    if let Some(loc) = msg.get("location") {
+        let lat = loc.get("latitude").and_then(Value::as_f64).unwrap_or(0.0);
+        let lon = loc.get("longitude").and_then(Value::as_f64).unwrap_or(0.0);
+        let live_s = loc.get("live_period").and_then(Value::as_u64);
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if let Some(secs) = live_s {
+            text.push_str(&format!("[location: {lat}, {lon} (live: {secs}s)]"));
+        } else {
+            text.push_str(&format!("[location: {lat}, {lon}]"));
+        }
+    }
     // Mentions and commands are `entities` offsets; a bot mention is any
     // mention of our own username anywhere in the text.
     let mentioned = msg
@@ -188,10 +288,22 @@ fn inbound(update: &Value, bot_username: &str, bot_id: &str) -> Option<Inbound> 
     if text.trim().is_empty() && files.is_empty() {
         return None;
     }
+    let thread_id = msg.get("message_thread_id").and_then(Value::as_i64);
+    let is_forum = chat
+        .get("is_forum")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let media_group_id = msg
+        .get("media_group_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some(Inbound {
         update_id,
         message_id: msg.get("message_id").and_then(Value::as_i64).unwrap_or(0),
         chat_id,
+        thread_id,
+        is_forum,
+        media_group_id,
         is_private,
         user_id,
         is_bot,
@@ -518,6 +630,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     }
     let _remove_pid = RemovePid(pid_path);
 
+    #[cfg(not(test))]
+    let _host_lock = acquire_host_lock(&host_lock_dir(), "telegram", config_path)?;
     let Some(lock_file) = crate::runner::open_lock_file(&parent.join("gateway.lock"))
         .map_err(|_| "cannot open gateway lock".to_string())?
     else {
@@ -599,7 +713,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         ),
     ));
 
-    let rest = Rest::production(&token);
+    let rest = Rest::production(&token).with_doh_ips().await;
     // A stale webhook silently eats the updates we poll for; clear it.
     if let Err(e) = rest.delete_webhook().await {
         eprintln!("[telegram] deleteWebhook failed: {e}");
@@ -660,11 +774,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         let rest = rest_del.clone();
         let live = live_del.clone();
         Box::pin(async move {
-            live.hold(&part.channel).await;
+            let (chat_id, _tid) = split_channel(&part.channel);
+            live.hold(chat_id).await;
             let result = if let Some(path) = part.content.strip_prefix(crate::graycmd::FILE_PREFIX)
             {
-                rest.send_document(&part.channel, Path::new(path), None)
-                    .await
+                rest.send_document(chat_id, Path::new(path), None).await
             } else {
                 send_markdown(&rest, &part.channel, &part.content).await
             };
@@ -810,17 +924,18 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut failures: u64 = 0;
+    let mut forum_menus: std::collections::HashSet<String> = std::collections::HashSet::new();
     let max_attachment_bytes = config
         .get("max_attachment_bytes")
         .and_then(Value::as_u64)
         .unwrap_or(8 * 1024 * 1024);
+    let poll_watchdog = std::time::Duration::from_secs(crate::transport::LONG_POLL_SECS + 35);
 
     'outer: loop {
         tokio::select! {
             _ = &mut sigterm_recv => break 'outer,
             _ = tokio::signal::ctrl_c() => break 'outer,
             res = set.join_next() => {
-                // A worker died; stop the daemon so the supervisor restarts.
                 set.abort_all();
                 match res {
                     Some(Ok(Err(e))) => return Err(e),
@@ -828,13 +943,24 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                     Some(Ok(Ok(()))) | None => return Ok(()),
                 }
             }
-            poll = rest.get_updates(offset) => {
+            poll_res = tokio::time::timeout(poll_watchdog, rest.get_updates(offset)) => {
+                let poll = match poll_res {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[telegram] getUpdates watchdog triggered after {}s", poll_watchdog.as_secs());
+                        failures = failures.saturating_add(1);
+                        continue;
+                    }
+                };
                 match poll {
                     Ok(updates) => {
                         failures = 0;
+                        let mut batch_msgs: Vec<Inbound> = Vec::new();
                         for update in &updates {
                             let id = update.get("update_id").and_then(Value::as_i64).unwrap_or(0);
-                            if let Some(cq) = update.get("callback_query") {
+                            if let Some(iq) = update.get("inline_query") {
+                                crate::graycmd::handle_inline_query(&rest, &registry, iq).await;
+                            } else if let Some(cq) = update.get("callback_query") {
                                 if cq.get("data").and_then(Value::as_str)
                                     == Some(crate::stream::STOP_CALLBACK)
                                 {
@@ -859,27 +985,60 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                                     )
                                     .await;
                                 }
-                            } else if let Some(m) = inbound(update, &bot_username, &bot_id) {
-                                handle_inbound(
-                                    &m,
-                                    &config,
-                                    config_path,
-                                    &store,
-                                    &rest,
-                                    &live,
-                                    &limiter,
-                                    &owner_id,
-                                    &allowed,
-                                    &bot_username,
-                                    &workdir,
-                                    max_attachment_bytes,
-                                    &registry,
-                                )
-                                .await;
+                            } else if let Some(mut m) = inbound(update, &bot_username, &bot_id) {
+                                if m.is_forum && forum_menus.insert(m.chat_id.clone()) {
+                                    crate::graycmd::register_chat_commands(&rest, &registry, &m.chat_id).await;
+                                }
+                                let merged = if let Some(prev) = batch_msgs.last_mut() {
+                                    let same_lane = prev.chat_id == m.chat_id
+                                        && prev.thread_id == m.thread_id
+                                        && prev.user_id == m.user_id;
+                                    let same_album = prev.media_group_id.is_some()
+                                        && prev.media_group_id == m.media_group_id;
+                                    let pair_photo_text = (prev.text.trim().is_empty() && !prev.files.is_empty() && m.files.is_empty() && !m.text.trim_start().starts_with('/'))
+                                        || (!prev.text.trim().is_empty() && !prev.text.trim_start().starts_with('/') && prev.files.is_empty() && m.text.trim().is_empty() && !m.files.is_empty());
+                                    if same_lane && (same_album || pair_photo_text) {
+                                        if !m.text.trim().is_empty() {
+                                            if !prev.text.is_empty() {
+                                                prev.text.push('\n');
+                                            }
+                                            prev.text.push_str(&m.text);
+                                        }
+                                        prev.files.extend(std::mem::take(&mut m.files));
+                                        prev.mentioned |= m.mentioned;
+                                        prev.reply_to_bot |= m.reply_to_bot;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !merged {
+                                    batch_msgs.push(m);
+                                }
                             }
                             if id >= offset {
                                 offset = id + 1;
                             }
+                        }
+                        for m in &batch_msgs {
+                            handle_inbound(
+                                m,
+                                &config,
+                                config_path,
+                                &store,
+                                &rest,
+                                &live,
+                                &limiter,
+                                &owner_id,
+                                &allowed,
+                                &bot_username,
+                                &workdir,
+                                max_attachment_bytes,
+                                &registry,
+                            )
+                            .await;
                         }
                         let _ = store.meta_set(OFFSET_KEY, &offset.to_string());
                     }
@@ -997,7 +1156,12 @@ async fn handle_inbound(
         m.update_id, m.user_id, m.chat_id, m.is_private
     );
 
-    let conversation = crate::session::conversation_key(&m.chat_id, &m.user_id, m.is_private);
+    let base_conv = crate::session::conversation_key(&m.chat_id, &m.user_id, m.is_private);
+    let conversation = match m.thread_id {
+        Some(tid) => format!("{base_conv}:{tid}"),
+        None => base_conv,
+    };
+    let channel = join_channel(&m.chat_id, m.thread_id);
 
     // Commands first: /start is the pairing hello for strangers and a
     // greeting for the admitted; the rest need admission. The registry
@@ -1197,7 +1361,7 @@ async fn handle_inbound(
         return;
     }
     let id = format!("tg:{}", m.update_id);
-    let queued = store.enqueue(&id, &m.chat_id, &prompt, Some(&conversation), capacity);
+    let queued = store.enqueue(&id, &channel, &prompt, Some(&conversation), capacity);
     if matches!(queued, Ok(true)) {
         live.received(&m.chat_id, m.message_id, &conversation).await;
     }
@@ -1244,4 +1408,70 @@ async fn send_pairing(store: &Store, rest: &Rest, m: &Inbound) {
             Err(e) => eprintln!("[telegram] pairing reply failed: {e}"),
         }
     }
+}
+
+#[cfg(not(test))]
+fn host_lock_dir() -> PathBuf {
+    for key in ["GRAY_HOST_LOCK_DIR", "XDG_STATE_HOME"] {
+        if let Ok(v) = std::env::var(key) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return if key == "GRAY_HOST_LOCK_DIR" {
+                    PathBuf::from(t)
+                } else {
+                    PathBuf::from(t).join("gray").join("locks")
+                };
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(v) = std::env::var("LOCALAPPDATA") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t).join("gray").join("locks");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("gray")
+            .join("locks");
+    }
+    std::env::temp_dir().join("gray-locks")
+}
+
+#[cfg(not(test))]
+fn acquire_host_lock(dir: &Path, role: &str, config_path: &Path) -> Result<std::fs::File, String> {
+    let mut db = std::fs::DirBuilder::new();
+    db.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        db.mode(0o700);
+    }
+    db.create(dir)
+        .map_err(|e| format!("cannot create host lock dir: {e}"))?;
+    let lock_path = dir.join(format!("{role}.lock"));
+    let Some(f) = crate::runner::open_lock_file(&lock_path)
+        .map_err(|e| format!("cannot open host lock: {e}"))?
+    else {
+        let rec_path = dir.join(format!("{role}.json"));
+        if let Ok(body) = std::fs::read_to_string(&rec_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                if let Some(pid) = v.get("pid").and_then(Value::as_u64) {
+                    return Err(format!(
+                        "Another {role} gateway is already running (pid {pid})"
+                    ));
+                }
+            }
+        }
+        return Err(format!("Another {role} gateway is already running"));
+    };
+    let rec = serde_json::json!({
+        "pid": std::process::id(),
+        "config": config_path.display().to_string(),
+    });
+    let _ = std::fs::write(dir.join(format!("{role}.json")), rec.to_string());
+    Ok(f)
 }

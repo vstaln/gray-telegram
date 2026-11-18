@@ -41,7 +41,10 @@ pub enum Command {
         token_stdin: bool,
     },
     Run,
-    Sidecar,
+    Sidecar {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
+    },
     /// Print the plugin manifest (what `gray plugin install telegram` reads).
     #[command(hide = true)]
     Manifest,
@@ -233,7 +236,16 @@ pub fn install_confirmed(answer: &str) -> bool {
 pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
     use serde_json::Value;
     match cmd {
-        Command::Sidecar => crate::sidecar::serve(config_path),
+        Command::Sidecar { args } => {
+            if args.is_empty() {
+                crate::sidecar::serve(config_path)
+            } else {
+                let argv = std::iter::once("gray-telegram".to_string()).chain(args.iter().cloned());
+                let cli = Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+                let cfg = cli.config.unwrap_or_else(|| config_path.to_path_buf());
+                run(&cli.command, &cfg)
+            }
+        }
         Command::Manifest => {
             use clap::CommandFactory;
             let mut m = crate::sidecar::MANIFEST.clone();
