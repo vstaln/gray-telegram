@@ -12,12 +12,12 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
-        "commands": [],
+        "commands": ["/telegram"],
         "hooks": ["prompt/context"],
         "tools": [{
             "name": "telegram_send",
             "label": "Telegram Send",
-            "description": "Send text to the owner's Telegram chat. HTML markup is allowed (Telegram parse_mode=HTML: <b>, <i>, <code>, <pre>, <a href>, <tg-spoiler>). Long text is chunked at 4096 characters. Put MEDIA:/absolute/path.png on its own line to upload files with it (images arrive as photos, others as documents).",
+            "description": "Send text to the owner's Telegram chat. Markdown is accepted and rendered for Telegram (bold, italic, strikethrough, inline code, fenced code with a language, links, quotes, headings, lists, task lists, rules, tables). Long text is split at 4096 characters. Put MEDIA:/absolute/path.png on its own line to upload files with it (images arrive as photos, others as documents).",
             "parameters": {
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
@@ -26,20 +26,20 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         }, {
             "name": "telegram_file",
             "label": "Telegram File",
-            "description": "Post local files to the owner's Telegram chat. Images (png/jpg/gif/webp) go through sendPhoto, everything else through sendDocument, with an optional HTML caption. Any readable path works except credentials/config files.",
+            "description": "Post local files to the owner's Telegram chat. Images (png/jpg/gif/webp) go through sendPhoto, everything else through sendDocument, with an optional caption written in markdown (max 1024 characters). Any readable path works except credentials/config files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path (absolute, ~/..., or relative to the working directory)"},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "up to 10 files, sent one message each"},
-                    "caption": {"type": "string", "description": "optional caption (HTML, max 1024 chars)"}
+                    "caption": {"type": "string", "description": "optional caption in markdown (max 1024 chars)"}
                 }
             }
         }]
     })
 });
 
-const PROMPT_CONTEXT: &str = "Telegram tools: telegram_send posts text with HTML markup (<b>, <i>, <code>, <pre>, <a href>, <tg-spoiler>); add a line MEDIA:/absolute/path to attach a file. telegram_file posts local files (images as photos, others as documents) with an optional caption. Replies are chunked at 4096 characters. Never send secrets.";
+const PROMPT_CONTEXT: &str = "Telegram tools: telegram_send posts markdown, rendered for Telegram (bold, italic, code, links, quotes, lists, tables); add a line MEDIA:/absolute/path to attach a file. telegram_file posts local files (images as photos, others as documents) with an optional markdown caption. Replies are split at 4096 characters. Never send secrets.";
 
 fn is_error() -> Value {
     json!({
@@ -73,6 +73,9 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
     if method == "prompt/context" {
         return json!({"text": PROMPT_CONTEXT});
     }
+    if method == "command/run" {
+        return run_command(params, config_path);
+    }
     if method == "tool/call" {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         return match name {
@@ -82,6 +85,74 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
         };
     }
     json!({"error": "Unsupported method"})
+}
+
+fn has_bot_token(config_path: &Path) -> bool {
+    crate::config::load_config(config_path)
+        .ok()
+        .and_then(|c| crate::config::token(&c).filter(|t| !t.trim().is_empty()))
+        .is_some()
+}
+
+fn run_command(params: &Value, config_path: &Path) -> Value {
+    let mut args: Vec<String> = params
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let head = args.first().map(String::as_str);
+    if matches!(head, Some("setup")) || (args.is_empty() && !has_bot_token(config_path)) {
+        if args.is_empty() {
+            args.push("setup".to_string());
+        }
+        return json!({
+            "terminal": args,
+            "text": "/telegram setup needs an interactive terminal"
+        });
+    }
+    if matches!(head, Some("run" | "sidecar")) {
+        return json!({ "text": "Run `gray telegram run` in a terminal." });
+    }
+    if args.is_empty() {
+        args.push("status".to_string());
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return json!({ "text": "cannot locate gray-telegram binary" });
+    };
+    match std::process::Command::new(exe)
+        .arg("--config")
+        .arg(config_path)
+        .args(&args)
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = [stdout.trim(), stderr.trim()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            let text = if combined.is_empty() {
+                if out.status.success() {
+                    "ok".to_string()
+                } else {
+                    format!("exited with {}", out.status)
+                }
+            } else {
+                combined
+            };
+            json!({ "text": text })
+        }
+        Err(e) => json!({ "text": format!("failed to run command: {e}") }),
+    }
 }
 
 /// The calling session's working directory, falling back to the sidecar's.
@@ -125,13 +196,10 @@ async fn send_text(params: &Value, config_path: &Path) -> Value {
     let (prose, media) = crate::media_tags::extract(content, &session_cwd(params), &roots);
     let rest = crate::transport::Rest::production(&token);
     if !prose.trim().is_empty() {
-        let chunks = match crate::text::split_message(
+        let chunks = crate::render::split_markdown(
             &prose,
-            crate::transport::MAX_MESSAGE_LEN - 48,
-        ) {
-            Ok(c) => c,
-            Err(e) => return not_sent(e),
-        };
+            crate::transport::MAX_MESSAGE_LEN.saturating_sub(64),
+        );
         for chunk in chunks.iter().take(8) {
             let send = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
@@ -243,10 +311,13 @@ async fn file_tool(params: &Value, config_path: &Path) -> Value {
         }
     }
     let rest = crate::transport::Rest::production(&token);
-    let caption = args.get("caption").and_then(Value::as_str);
+    let caption = args
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(|text| crate::render::caption_html(text, crate::transport::MAX_CAPTION_LEN));
     let mut sent = 0;
     for upload in crate::media_tags::load(&paths).into_iter().take(10) {
-        let cap = if sent == 0 { caption } else { None };
+        let cap = if sent == 0 { caption.as_deref() } else { None };
         let send = if upload.is_photo() {
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),

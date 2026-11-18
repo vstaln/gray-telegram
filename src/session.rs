@@ -114,6 +114,10 @@ pub fn conversation_key(chat_id: &str, user_id: &str, is_private: bool) -> Strin
     }
 }
 
+pub fn private_conversation(conversation: &str) -> bool {
+    !conversation.contains(":user:")
+}
+
 /// Forget the transcript in one private conversation home and leave a fresh
 /// generation marker behind. The marker prevents a turn that was already in
 /// flight during `/new` from restoring its old session pointer when it exits.
