@@ -40,10 +40,7 @@ pub async fn check(config: &Value, rest: &Rest) -> Result<(), String> {
         .get("username")
         .and_then(Value::as_str)
         .unwrap_or("(unnamed)");
-    let chat_id = config
-        .get("chat_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let chat_id = config.get("chat_id").and_then(Value::as_str).unwrap_or("");
     rest.get_chat(chat_id)
         .await
         .map_err(|_| "home chat is not reachable — has it messaged the bot once?".to_string())?;

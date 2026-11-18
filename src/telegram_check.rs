@@ -45,16 +45,18 @@ impl std::error::Error for CheckError {}
 pub async fn check_bot_token(rest: &Rest) -> Result<BotCheck, CheckError> {
     let me = tokio::time::timeout(std::time::Duration::from_secs(10), rest.get_me())
         .await
-        .map_err(|_| {
-            CheckError::Transient("Telegram did not answer the token check".to_string())
-        })?
+        .map_err(|_| CheckError::Transient("Telegram did not answer the token check".to_string()))?
         .map_err(|e| match e {
             TransportError::Auth(_) => {
                 CheckError::Invalid("Telegram rejected the bot token".to_string())
             }
             other => CheckError::Transient(other.to_string()),
         })?;
-    let id = me.get("id").and_then(Value::as_i64).unwrap_or(0).to_string();
+    let id = me
+        .get("id")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .to_string();
     let username = me
         .get("username")
         .and_then(Value::as_str)
