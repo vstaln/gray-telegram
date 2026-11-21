@@ -270,7 +270,10 @@ pub async fn run_gray_input(
         shell_word(&abs_config)
     );
     #[cfg(windows)]
-    let script = format!("@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n", exe, abs_config);
+    let script = format!(
+        "@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n",
+        exe, abs_config
+    );
     std::fs::write(&launcher, script)
         .map_err(|_| RunError::Io("cannot write launcher".to_string()))?;
     #[cfg(unix)]

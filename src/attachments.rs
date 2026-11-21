@@ -33,7 +33,11 @@ pub async fn save(
         })
         .take(64)
         .collect();
-    let safe = if safe.is_empty() { "file".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
     let dir = workdir.join("attachments");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{msg_id}-{safe}"));

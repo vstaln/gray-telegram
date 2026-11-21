@@ -125,13 +125,11 @@ async fn send_text(params: &Value, config_path: &Path) -> Value {
     let (prose, media) = crate::media_tags::extract(content, &session_cwd(params), &roots);
     let rest = crate::transport::Rest::production(&token);
     if !prose.trim().is_empty() {
-        let chunks = match crate::text::split_message(
-            &prose,
-            crate::transport::MAX_MESSAGE_LEN - 48,
-        ) {
-            Ok(c) => c,
-            Err(e) => return not_sent(e),
-        };
+        let chunks =
+            match crate::text::split_message(&prose, crate::transport::MAX_MESSAGE_LEN - 48) {
+                Ok(c) => c,
+                Err(e) => return not_sent(e),
+            };
         for chunk in chunks.iter().take(8) {
             let send = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
