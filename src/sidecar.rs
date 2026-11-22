@@ -96,7 +96,7 @@ fn has_bot_token(config_path: &Path) -> bool {
 
 fn run_command(params: &Value, config_path: &Path) -> Value {
     let mut args: Vec<String> = params
-        .get("args")
+        .get("argv")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()

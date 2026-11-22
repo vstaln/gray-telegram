@@ -436,8 +436,6 @@ fn ask_user_ids(io: &mut dyn Prompter) -> Result<(String, String), String> {
     let owner = io.prompt("Your Telegram user ID (Enter to leave unpaired): ")?;
     let owner = owner.trim().to_string();
     if owner.is_empty() {
-        // Nobody admitted yet: strangers get pairing replies until the
-        // operator approves a code. A home chat is still required.
         let chat = io.prompt("Home chat ID for notifications: ")?;
         let chat = chat.trim().to_string();
         if !crate::config::telegram_id(&Value::String(chat.clone())) {
@@ -947,7 +945,6 @@ pub async fn send_hello(config: &Value) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// The whole wizard. Returns `true` when a config was written.
 pub async fn run(
     config_path: &Path,
     io: &mut dyn Prompter,
@@ -966,7 +963,6 @@ pub async fn run(
     .await
 }
 
-/// Wizard with injectable IO and Telegram/network steps (tests drive fakes).
 pub async fn run_with(
     config_path: &Path,
     io: &mut dyn Prompter,

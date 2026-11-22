@@ -875,8 +875,6 @@ pub async fn callback(
                 }
                 Some("ui") => {
                     let document = result.get("document").cloned().unwrap_or(Value::Null);
-                    // Editable docs keep their token, but if core ever hands a
-                    // fresh one the picker must re-key or the next press misses.
                     let next_tok = result.get("token").and_then(Value::as_str).unwrap_or(tok);
                     let fallback = result
                         .get("fallback_text")
@@ -916,8 +914,6 @@ pub async fn callback(
                     }
                 }
                 _ => {
-                    // kind text + close: the flow is done — show the text, drop
-                    // the keyboard, and free the stored document.
                     let _ = store.cmd_doc_delete(tok);
                     let text = result
                         .get("text")
