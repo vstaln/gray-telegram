@@ -22,13 +22,20 @@ gray plugin check ./target/release/gray-telegram   # conformance check
 ## Setup
 
 ```sh
-gray-telegram setup            # token + your user id + home chat
-gray-telegram setup --pair     # same, but discovers your ids via a
-                               # one-time code you DM the bot
+gray-telegram setup               # create a new bot in Telegram (recommended),
+                                  # or use a @BotFather token
+gray-telegram setup --create      # create the bot without BotFather: scan the
+                                  # QR code and confirm it in Telegram
+gray-telegram setup --token-stdin # read the BotFather token from stdin
+gray-telegram setup --pair        # a token setup that discovers your ids via a
+                                  # one-time code you DM the bot
 ```
 
-The token comes from `@BotFather`, then from a hidden prompt or the
-`TELEGRAM_BOT_TOKEN` environment variable. Config lives at
+Creating the bot goes through the Gray Setup service: it prints a QR code and
+a link, waits while you confirm the new bot in Telegram, and takes the owner
+id from the pairing. The token path asks `@BotFather` first, then reads a
+hidden prompt or `TELEGRAM_BOT_TOKEN`. Either way setup ends by sending the
+new bot one hello message. Config lives at
 `~/.config/gray-telegram/config.json` (0600); use `--config <path>` to
 place it elsewhere.
 
@@ -39,11 +46,11 @@ the owner).
 ## Run
 
 ```sh
-gray-telegram run          # foreground
-gray-telegram install      # runit / systemd --user / detached fallback
+gray-telegram run                 # foreground
+gray-telegram install             # runit / systemd --user / detached fallback
 gray-telegram status|stop|restart|uninstall
-gray-telegram doctor       # gray binary, provider, getMe, home chat
-gray-telegram register     # register the sidecar tools with gray
+gray-telegram doctor              # gray binary, provider, getMe, home chat
+gray-telegram register            # register the sidecar tools with gray
 ```
 
 Useful commands: `queue list|cancel`, `schedule add|list|remove`,

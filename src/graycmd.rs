@@ -275,6 +275,70 @@ fn gray_bin(config: &Value) -> Option<PathBuf> {
 }
 
 pub(crate) const FILE_PREFIX: &str = "FILE:";
+pub const MODEL_DEFAULT_CALLBACK: &str = "md";
+
+fn home_model(home: &Path) -> Option<String> {
+    std::fs::read(home.join("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|provider| {
+            provider
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn seed_home_model(home: &Path, model: &str) {
+    let path = home.join("config.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(mut provider) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    if !provider.is_object() {
+        return;
+    }
+    provider["model"] = Value::String(model.to_string());
+    let _ = crate::config::atomic_json(&path, &provider);
+}
+
+fn sync_chat_model(
+    config: &Value,
+    store: &crate::durable::Store,
+    conversation: &str,
+    home: &Path,
+    before: Option<String>,
+) -> Option<String> {
+    let after = home_model(home);
+    if after == before {
+        return None;
+    }
+    let Some(chosen) = after else {
+        let _ = store.model_clear(conversation);
+        return None;
+    };
+    let default = crate::config::active_model(config).map(|(model, _)| model);
+    if default.as_deref() == Some(chosen.as_str()) {
+        let _ = store.model_clear(conversation);
+        return None;
+    }
+    store.model_set(conversation, &chosen).ok().map(|_| chosen)
+}
+
+async fn announce_chat_model(rest: &crate::transport::Rest, chat_id: &str, model: &str) {
+    let text = format!("Model for this chat: {}", crate::text::escape_html(model));
+    let keyboard = json!({"inline_keyboard": [[{
+        "text": "Make default for Telegram",
+        "callback_data": MODEL_DEFAULT_CALLBACK
+    }]]});
+    if let Err(e) = rest.send_markup(chat_id, &text, &keyboard).await {
+        eprintln!("[telegram] model notice failed in chat {chat_id}: {e}");
+    }
+}
 
 fn pager_kb(token: &str, cur: usize, total: usize) -> Value {
     json!({"inline_keyboard": [[
@@ -303,37 +367,14 @@ async fn send_result_text(
     home: &Path,
     text: &str,
 ) {
-    let limit = crate::transport::MAX_MESSAGE_LEN - 48;
-    if text.trim().is_empty() {
+    let limit = crate::transport::MAX_MESSAGE_LEN - 64;
+    let pages = crate::render::split_markdown(text, limit);
+    if pages.is_empty() {
         let _ = rest.send_text(chat_id, "Done.").await;
         return;
     }
-    let body = md_to_html(&crate::text::sanitize(text));
-    if crate::text::utf16_len(&body) <= limit {
-        if let Err(e) = rest.send_text(chat_id, &body).await {
-            eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
-        }
-        return;
-    }
-    let mut budget = limit - 24;
-    let pages: Vec<String> = loop {
-        let rendered: Vec<String> = crate::text::paginate_markdown(text, budget)
-            .into_iter()
-            .map(|page| md_to_html(&crate::text::sanitize(&page)))
-            .collect();
-        if rendered.iter().all(|p| crate::text::utf16_len(p) <= limit) {
-            break rendered;
-        }
-        if budget <= 128 {
-            break rendered
-                .into_iter()
-                .flat_map(|p| crate::text::split_message(&p, limit).unwrap_or_else(|_| vec![p]))
-                .collect();
-        }
-        budget /= 2;
-    };
-    if pages.len() <= 1 {
-        if let Err(e) = rest.send_text(chat_id, &body).await {
+    if pages.len() == 1 {
+        if let Err(e) = rest.send_text(chat_id, &pages[0]).await {
             eprintln!("[telegram] command reply failed in chat {chat_id}: {e}");
         }
         return;
@@ -396,12 +437,28 @@ async fn send_ui(
         crate::durable::now_secs(),
     );
     let text = if body.trim().is_empty() {
-        md_to_html(fallback)
+        crate::render::markdown_to_html(fallback)
     } else {
-        md_to_html(&crate::text::sanitize(&body))
+        crate::render::markdown_to_html(&body)
     };
-    let send = rest.send_markup(chat_id, &text, &markup).await;
-    if let Err(e) = send {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match rest.send_markup(chat_id, &text, &markup).await {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) if e.is_retryable() && attempt < 2 => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = last_err {
         eprintln!("[telegram] picker post failed in chat {chat_id}: {e}");
         let _ = store.cmd_doc_delete(token);
     }
@@ -453,6 +510,11 @@ pub async fn dispatch(
         let _ = builder.create(&home);
     }
 
+    if let Some(model) = store.model_get(conversation).ok().flatten() {
+        seed_home_model(&home, &model);
+    }
+    let mut before = home_model(&home);
+
     let mut argv: Vec<&str> = vec!["run", name];
     if !args.trim().is_empty() {
         argv.push(args.trim());
@@ -486,6 +548,10 @@ pub async fn dispatch(
             let _ = rest.send_text(chat_id, &text).await;
         }
         Ok(Reply::Result(result)) => {
+            if let Some(model) = sync_chat_model(config, store, conversation, &home, before.take())
+            {
+                announce_chat_model(rest, chat_id, &model).await;
+            }
             match result.get("kind").and_then(Value::as_str) {
                 Some("prompt") => {
                     let prompt = result.get("prompt").and_then(Value::as_str).unwrap_or("");
@@ -533,6 +599,7 @@ pub async fn dispatch(
 /// `cmd interact`, and re-render the picker message per the result.
 pub async fn callback(
     config: &Value,
+    config_path: &Path,
     store: &crate::durable::Store,
     rest: &crate::transport::Rest,
     cq: &Value,
@@ -566,6 +633,85 @@ pub async fn callback(
             let _ = rest.answer_callback(&cb_id, text.as_deref(), alert).await;
         }
     };
+
+    if data == MODEL_DEFAULT_CALLBACK {
+        if !crate::policy::is_allowed_user(&from_id, owner_id, allowed) {
+            toast(Some("Only the owner can change the default."), true).await;
+            return;
+        }
+        let is_private = msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
+        let conversation = crate::session::conversation_key(&chat_id, &from_id, is_private);
+        let Some(model) = store.model_get(&conversation).ok().flatten() else {
+            toast(Some("No chat model to save."), false).await;
+            return;
+        };
+        let mut next = config.clone();
+        next["model"] = Value::String(model.clone());
+        if crate::config::validate_config(&next).is_err()
+            || crate::config::atomic_json(config_path, &next).is_err()
+        {
+            toast(Some("Cannot write the config file."), true).await;
+            return;
+        }
+        let _ = store.model_clear(&conversation);
+        let text = format!(
+            "Model for this chat: {} — now the Telegram default.",
+            crate::text::escape_html(&model)
+        );
+        let default_kb = json!({"inline_keyboard": []});
+        if let Err(e) = rest
+            .edit_message(&chat_id, message_id, &text, Some(&default_kb))
+            .await
+        {
+            eprintln!("[telegram] default-model edit failed in chat {chat_id}: {e}");
+        }
+        toast(Some("Saved as the Telegram default."), false).await;
+        return;
+    }
+
+    if data.starts_with("gs|") {
+        let mut parts = data.split('|');
+        let (Some("gs"), Some(tok), Some(lid), Some(page_str), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            toast(Some("Unknown action."), false).await;
+            return;
+        };
+        if !crate::policy::is_allowed_user(&from_id, owner_id, allowed) {
+            toast(Some("This picker is not for you."), true).await;
+            return;
+        }
+        let row = match store.cmd_doc_get(tok, DOC_TTL_SECS, crate::durable::now_secs()) {
+            Ok(Some(row)) => row,
+            _ => {
+                toast(Some("Picker expired — send the command again."), false).await;
+                return;
+            }
+        };
+        if row.owner != from_id {
+            toast(Some("This picker belongs to someone else."), true).await;
+            return;
+        }
+        let Ok(page) = page_str.parse::<usize>() else {
+            toast(Some("Unknown action."), false).await;
+            return;
+        };
+        let doc: Value = serde_json::from_str(&row.doc).unwrap_or(Value::Null);
+        let mut pages = std::collections::HashMap::new();
+        pages.insert(lid.to_string(), page);
+        if let Some((body, markup)) = compile_with_pages(&doc, tok, &pages) {
+            let text = crate::render::markdown_to_html(&body);
+            let _ = rest
+                .edit_message(&chat_id, message_id, &text, Some(&markup))
+                .await;
+        }
+        toast(None, false).await;
+        return;
+    }
 
     if data.starts_with("pg|") {
         let mut parts = data.split('|');
@@ -651,6 +797,12 @@ pub async fn callback(
         return;
     };
     // The home comes from the stored row — the same scope `run` used.
+    let is_private = msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
+    let conversation = crate::session::conversation_key(&chat_id, &from_id, is_private);
+    if let Some(model) = store.model_get(&conversation).ok().flatten() {
+        seed_home_model(Path::new(&row.home), &model);
+    }
+    let mut before = home_model(Path::new(&row.home));
     let action_json = serde_json::to_string(&action).unwrap_or_default();
     let reply = match cmd_json(&bin, Path::new(&row.home), &["interact", tok, &action_json]).await {
         Ok(v) => v,
@@ -680,97 +832,101 @@ pub async fn callback(
                 toast(Some(&short), false).await;
             }
         },
-        Ok(Reply::Result(result)) => match result.get("kind").and_then(Value::as_str) {
-            Some("prompt") => {
-                let prompt = result.get("prompt").and_then(Value::as_str).unwrap_or("");
-                let fallback = result
-                    .get("fallback_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let is_private =
-                    msg.pointer("/chat/type").and_then(Value::as_str) == Some("private");
-                let conv = crate::session::conversation_key(&chat_id, &from_id, is_private);
-                let capacity = config
-                    .get("queue_capacity")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1000);
-                let id = format!("tg:cmd:{}", crate::durable::uuid_hex());
-                match store.enqueue(&id, &chat_id, prompt, Some(&conv), capacity) {
-                    Ok(true) => {
-                        let text = if fallback.trim().is_empty() {
-                            "Working on it.".to_string()
-                        } else {
-                            crate::text::escape_html(fallback)
-                        };
-                        let _ = rest.send_text(&chat_id, &text).await;
-                        toast(None, false).await;
-                    }
-                    Ok(false) => {
-                        toast(Some("That turn is already queued."), false).await;
-                    }
-                    Err(e) => {
-                        let short: String = e.chars().take(180).collect();
-                        toast(Some(&short), false).await;
-                    }
-                }
+        Ok(Reply::Result(result)) => {
+            if let Some(model) = sync_chat_model(
+                config,
+                store,
+                &conversation,
+                Path::new(&row.home),
+                before.take(),
+            ) {
+                announce_chat_model(rest, &chat_id, &model).await;
             }
-            Some("ui") => {
-                let document = result.get("document").cloned().unwrap_or(Value::Null);
-                // Editable docs keep their token, but if core ever hands a
-                // fresh one the picker must re-key or the next press misses.
-                let next_tok = result.get("token").and_then(Value::as_str).unwrap_or(tok);
-                let fallback = result
-                    .get("fallback_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                match compile(&document, next_tok) {
-                    Some((body, markup)) => {
-                        let text = if body.trim().is_empty() {
-                            md_to_html(fallback)
-                        } else {
-                            md_to_html(&crate::text::sanitize(&body))
-                        };
-                        let doc_json = serde_json::to_string(&document).unwrap_or_default();
-                        let _ = store.cmd_doc_put(
-                            next_tok, &doc_json, &row.home, &row.name, &row.owner, now,
-                        );
-                        if next_tok != tok {
-                            let _ = store.cmd_doc_delete(tok);
+            match result.get("kind").and_then(Value::as_str) {
+                Some("prompt") => {
+                    let prompt = result.get("prompt").and_then(Value::as_str).unwrap_or("");
+                    let fallback = result
+                        .get("fallback_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let capacity = config
+                        .get("queue_capacity")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1000);
+                    let id = format!("tg:cmd:{}", crate::durable::uuid_hex());
+                    match store.enqueue(&id, &chat_id, prompt, Some(&conversation), capacity) {
+                        Ok(true) => {
+                            let text = if fallback.trim().is_empty() {
+                                "Working on it.".to_string()
+                            } else {
+                                crate::text::escape_html(fallback)
+                            };
+                            let _ = rest.send_text(&chat_id, &text).await;
+                            toast(None, false).await;
                         }
-                        let _ = rest
-                            .edit_message(&chat_id, message_id, &text, Some(&markup))
-                            .await;
-                        toast(None, false).await;
-                    }
-                    None => {
-                        let _ = store.cmd_doc_delete(tok);
-                        let _ = rest
-                            .edit_message(
-                                &chat_id,
-                                message_id,
-                                &md_to_html(fallback),
-                                Some(&empty_kb),
-                            )
-                            .await;
-                        toast(None, false).await;
+                        Ok(false) => {
+                            toast(Some("That turn is already queued."), false).await;
+                        }
+                        Err(e) => {
+                            let short: String = e.chars().take(180).collect();
+                            toast(Some(&short), false).await;
+                        }
                     }
                 }
+                Some("ui") => {
+                    let document = result.get("document").cloned().unwrap_or(Value::Null);
+                    let next_tok = result.get("token").and_then(Value::as_str).unwrap_or(tok);
+                    let fallback = result
+                        .get("fallback_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    match compile(&document, next_tok) {
+                        Some((body, markup)) => {
+                            let text = if body.trim().is_empty() {
+                                crate::render::markdown_to_html(fallback)
+                            } else {
+                                crate::render::markdown_to_html(&body)
+                            };
+                            let doc_json = serde_json::to_string(&document).unwrap_or_default();
+                            let _ = store.cmd_doc_put(
+                                next_tok, &doc_json, &row.home, &row.name, &row.owner, now,
+                            );
+                            if next_tok != tok {
+                                let _ = store.cmd_doc_delete(tok);
+                            }
+                            let _ = rest
+                                .edit_message(&chat_id, message_id, &text, Some(&markup))
+                                .await;
+                            toast(None, false).await;
+                        }
+                        None => {
+                            let _ = store.cmd_doc_delete(tok);
+                            let _ = rest
+                                .edit_message(
+                                    &chat_id,
+                                    message_id,
+                                    &crate::render::markdown_to_html(fallback),
+                                    Some(&empty_kb),
+                                )
+                                .await;
+                            toast(None, false).await;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = store.cmd_doc_delete(tok);
+                    let text = result
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Done.");
+                    let body = crate::render::markdown_to_html(text);
+                    let _ = rest
+                        .edit_message(&chat_id, message_id, &body, Some(&empty_kb))
+                        .await;
+                    toast(None, false).await;
+                }
             }
-            _ => {
-                // kind text + close: the flow is done — show the text, drop
-                // the keyboard, and free the stored document.
-                let _ = store.cmd_doc_delete(tok);
-                let text = result
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Done.");
-                let body = md_to_html(&crate::text::sanitize(text));
-                let _ = rest
-                    .edit_message(&chat_id, message_id, &body, Some(&empty_kb))
-                    .await;
-                toast(None, false).await;
-            }
-        },
+        }
     }
 }
 
@@ -825,7 +981,22 @@ fn cb_data(tok: &str, lid: &str, arg: &str) -> Option<String> {
 
 /// `gray.ui` v1 → (markdown body, inline_keyboard markup). `None` means the
 /// document cannot render on Telegram — the caller posts `fallback_text`.
+const SELECT_PAGE: usize = 6;
+
+fn select_cb_page(tok: &str, lid: &str, page: usize) -> Option<String> {
+    let data = format!("gs|{tok}|{lid}|{page}");
+    (data.len() <= CALLBACK_MAX).then_some(data)
+}
+
 fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
+    compile_with_pages(document, token, &std::collections::HashMap::new())
+}
+
+fn compile_with_pages(
+    document: &Value,
+    token: &str,
+    pages: &std::collections::HashMap<String, usize>,
+) -> Option<(String, Value)> {
     if token.is_empty() {
         return None;
     }
@@ -857,31 +1028,68 @@ fn compile(document: &Value, token: &str) -> Option<(String, Value)> {
                                 .and_then(Value::as_array)
                                 .cloned()
                                 .unwrap_or_default();
-                            // Telegram pickers are a vertical button list —
-                            // one row per option.
-                            for (i, opt) in options.iter().take(25).enumerate() {
-                                let label = opt
-                                    .get("label")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                if label.is_empty() {
-                                    continue;
-                                }
-                                let label = match opt.get("description").and_then(Value::as_str) {
-                                    Some(d) if !d.is_empty() => {
-                                        truncate(&format!("{label} — {d}"), 80)
+                            let formatted: Vec<(usize, String)> = options
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, opt)| {
+                                    let raw =
+                                        opt.get("label").and_then(Value::as_str).unwrap_or("");
+                                    if raw.is_empty() {
+                                        return None;
                                     }
-                                    _ => truncate(&label, 80),
-                                };
-                                let label =
-                                    if opt.get("default").and_then(Value::as_bool) == Some(true) {
+                                    let label = truncate(raw, 48);
+                                    let label = if opt.get("default").and_then(Value::as_bool)
+                                        == Some(true)
+                                    {
                                         format!("• {label}")
                                     } else {
                                         label
                                     };
-                                let data = cb_data(token, lid, &i.to_string())?;
-                                rows.push(json!([{"text": label, "callback_data": data}]));
+                                    Some((i, label))
+                                })
+                                .collect();
+                            let inline = formatted.len() >= 3
+                                && formatted.len() <= 4
+                                && formatted.iter().all(|(_, l)| l.chars().count() <= 12);
+                            if inline {
+                                let mut row_btns = Vec::with_capacity(formatted.len());
+                                for (i, label) in formatted {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    row_btns.push(json!({"text": label, "callback_data": data}));
+                                }
+                                rows.push(Value::Array(row_btns));
+                            } else if formatted.len() > SELECT_PAGE {
+                                let total = formatted.len().div_ceil(SELECT_PAGE);
+                                let default_page = options
+                                    .iter()
+                                    .position(|o| {
+                                        o.get("default").and_then(Value::as_bool) == Some(true)
+                                    })
+                                    .map(|idx| idx / SELECT_PAGE)
+                                    .unwrap_or(0);
+                                let page = pages
+                                    .get(lid)
+                                    .copied()
+                                    .unwrap_or(default_page)
+                                    .min(total - 1);
+                                let start = page * SELECT_PAGE;
+                                let end = (start + SELECT_PAGE).min(formatted.len());
+                                for (i, label) in &formatted[start..end] {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    rows.push(json!([{"text": label, "callback_data": data}]));
+                                }
+                                let prev = page.saturating_sub(1);
+                                let next = (page + 1).min(total - 1);
+                                rows.push(json!([
+                                    {"text": "◀", "callback_data": select_cb_page(token, lid, prev)?},
+                                    {"text": format!("{}/{}", page + 1, total), "callback_data": select_cb_page(token, lid, page)?},
+                                    {"text": "▶", "callback_data": select_cb_page(token, lid, next)?},
+                                ]));
+                            } else {
+                                for (i, label) in formatted {
+                                    let data = cb_data(token, lid, &i.to_string())?;
+                                    rows.push(json!([{"text": label, "callback_data": data}]));
+                                }
                             }
                         }
                         Some("button") => {
@@ -995,145 +1203,69 @@ pub fn command_menu(list: Option<&CommandList>) -> Vec<Value> {
 /// (no `cmd`) just leaves the built-in menu.
 pub async fn register_commands(rest: &crate::transport::Rest, registry: &Registry) {
     let list = registry.get().await;
-    if let Err(e) = rest.set_my_commands(&command_menu(list.as_deref())).await {
-        eprintln!("[telegram] setMyCommands failed: {e}");
-    }
-}
-
-/// `gray cmd` answers markdown; sendMessage speaks HTML. This is the small
-/// common-denominator translation — fences, code spans, bold, italic,
-/// links — not a CommonMark renderer; transport's plain-text retry is the
-/// net for anything outside it.
-pub fn md_to_html(md: &str) -> String {
-    let mut out = String::new();
-    let mut rest = md;
-    while let Some(start) = rest.find("```") {
-        out.push_str(&inline(&crate::text::escape_html(&rest[..start])));
-        let after = &rest[start + 3..];
-        // An optional language tag rides the opening fence line.
-        let after = after.split_once('\n').map(|(_, r)| r).unwrap_or(after);
-        match after.find("```") {
-            Some(end) => {
-                out.push_str("<pre>");
-                out.push_str(&crate::text::escape_html(&after[..end]));
-                out.push_str("</pre>");
-                rest = &after[end + 3..];
-            }
-            None => {
-                out.push_str("<pre>");
-                out.push_str(&crate::text::escape_html(after));
-                out.push_str("</pre>");
-                rest = "";
-            }
-        }
-    }
-    out.push_str(&inline(&crate::text::escape_html(rest)));
-    out
-}
-
-/// Inline markup on already-escaped text. Code spans are extracted to
-/// placeholders first so `*` inside `` `code` `` stays literal.
-fn inline(escaped: &str) -> String {
-    let (s, codes) = extract_code(escaped);
-    let s = delim(&s, "**", "<b>", "</b>", false);
-    let s = delim(&s, "__", "<b>", "</b>", true);
-    let s = delim(&s, "*", "<i>", "</i>", false);
-    let s = delim(&s, "_", "<i>", "</i>", true);
-    let s = links(&s);
-    let mut out = s;
-    for (i, code) in codes.iter().enumerate() {
-        out = out.replace(&format!("\u{1}{i}\u{1}"), &format!("<code>{code}</code>"));
-    }
-    out
-}
-
-/// Pair `open`/`close` around `d`-delimited runs; an odd trailing mark stays
-/// literal and never leaves a dangling tag. `wordy` delimiters (`_`) ignore
-/// marks with alphanumerics on both sides so `snake_case` names survive.
-fn delim(s: &str, d: &str, open: &str, close: &str, wordy: bool) -> String {
-    let active = |at: usize| -> bool {
-        if !wordy {
-            return true;
-        }
-        let word = |c: Option<char>| c.map(|c| c.is_alphanumeric()).unwrap_or(false);
-        !(word(s[..at].chars().last()) && word(s[at + d.len()..].chars().next()))
-    };
-    let mut marks: Vec<usize> = Vec::new();
-    let mut scan = 0;
-    while let Some(i) = s[scan..].find(d) {
-        let at = scan + i;
-        if active(at) {
-            marks.push(at);
-        }
-        scan = at + d.len();
-    }
-    let pairs = marks.len() / 2 * 2;
-    let mut out = String::new();
-    let mut cursor = 0;
-    for (n, at) in marks.iter().enumerate() {
-        out.push_str(&s[cursor..*at]);
-        out.push_str(if n < pairs {
-            if n % 2 == 0 {
-                open
-            } else {
-                close
-            }
-        } else {
-            d
-        });
-        cursor = at + d.len();
-    }
-    out.push_str(&s[cursor..]);
-    out
-}
-
-/// `` `x` `` → placeholder slots; restored after the other delimiters run.
-fn extract_code(escaped: &str) -> (String, Vec<String>) {
-    let mut codes = Vec::new();
-    let mut out = String::new();
-    let mut rest = escaped;
-    while let Some(i) = rest.find('`') {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i + 1..];
-        match tail.find('`') {
-            Some(j) => {
-                codes.push(tail[..j].to_string());
-                out.push_str(&format!("\u{1}{}\u{1}", codes.len() - 1));
-                rest = &tail[j + 1..];
-            }
-            None => {
-                out.push('`');
-                rest = tail;
-            }
-        }
-    }
-    out.push_str(rest);
-    (out, codes)
-}
-
-/// `[label](url)` → `<a href>`. Anything half-formed stays literal.
-fn links(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find("](") {
-        let Some(j) = rest[..i].rfind('[') else {
-            out.push_str(&rest[..i + 2]);
-            rest = &rest[i + 2..];
-            continue;
-        };
-        let Some(k) = rest[i + 2..].find(')') else {
+    let menu = command_menu(list.as_deref());
+    for scope in [
+        serde_json::json!({"type": "default"}),
+        serde_json::json!({"type": "all_private_chats"}),
+        serde_json::json!({"type": "all_group_chats"}),
+    ] {
+        if let Err(e) = rest.set_my_commands_scoped(&menu, scope).await {
+            eprintln!("[telegram] setMyCommands failed: {e}");
             break;
-        };
-        out.push_str(&rest[..j]);
-        out.push_str(&format!(
-            "<a href=\"{}\">{}</a>",
-            &rest[i + 2..i + 2 + k],
-            &rest[j + 1..i]
-        ));
-        rest = &rest[i + 2 + k + 1..];
+        }
     }
-    out.push_str(rest);
-    out
+}
+
+pub async fn register_chat_commands(
+    rest: &crate::transport::Rest,
+    registry: &Registry,
+    chat_id: &str,
+) {
+    let Ok(id) = chat_id.parse::<i64>() else {
+        return;
+    };
+    let list = registry.get().await;
+    let menu = command_menu(list.as_deref());
+    let _ = rest
+        .set_my_commands_scoped(&menu, serde_json::json!({"type": "chat", "chat_id": id}))
+        .await;
+}
+
+pub async fn handle_inline_query(rest: &crate::transport::Rest, registry: &Registry, iq: &Value) {
+    let Some(iq_id) = iq.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let q = iq
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    let list = registry.get().await;
+    let menu = command_menu(list.as_deref());
+    let mut results = Vec::new();
+    for (idx, item) in menu.iter().enumerate() {
+        let cmd = item.get("command").and_then(Value::as_str).unwrap_or("");
+        let desc = item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !q.is_empty() && !cmd.contains(&q) && !desc.to_ascii_lowercase().contains(&q) {
+            continue;
+        }
+        results.push(serde_json::json!({
+            "type": "article",
+            "id": format!("cmd-{idx}"),
+            "title": format!("/{cmd}"),
+            "description": desc,
+            "input_message_content": {"message_text": format!("/{cmd}")},
+        }));
+        if results.len() >= 25 {
+            break;
+        }
+    }
+    let _ = rest.answer_inline_query(iq_id, &results).await;
 }
 
 #[cfg(test)]
@@ -1234,22 +1366,6 @@ mod tests {
         let doc = model_picker();
         let long_tok = "t".repeat(60);
         assert!(compile(&doc, &long_tok).is_none());
-    }
-
-    #[test]
-    fn markdown_renders_html() {
-        assert_eq!(
-            md_to_html("**Model** — `gpt-5` · effort `m`"),
-            "<b>Model</b> — <code>gpt-5</code> · effort <code>m</code>"
-        );
-        assert_eq!(md_to_html("a_b_c"), "a_b_c");
-        assert_eq!(md_to_html("_x_"), "<i>x</i>");
-        assert_eq!(
-            md_to_html("see [docs](https://x.dev/y)"),
-            "see <a href=\"https://x.dev/y\">docs</a>"
-        );
-        assert_eq!(md_to_html("a < b"), "a &lt; b");
-        assert_eq!(md_to_html("```\nx<y\n```"), "<pre>x&lt;y\n</pre>");
     }
 
     #[test]
